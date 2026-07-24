@@ -14,9 +14,14 @@
 //             swirl/hash (Cleanup knob = dry/filtered mix)
 //   smoother  envelope-ratio gain on the top octave clamps warbly level
 //             flutter without touching stable content (Smooth knob)
-//   regen     upper mids (3-8 kHz) -> soft asymmetric saturator -> highpassed
-//             above the corner and mixed in, level-linked to the real
-//             midrange envelope so quiet passages don't hiss (Regen knob)
+//   regen     RESTORES the destroyed band. The surviving octave below the wall
+//             is squared -- which translates it up an octave, keeping tonal
+//             content tonal and noise noisy -- then highpassed into the gap and
+//             levelled by extrapolating the source's own spectral slope, so it
+//             continues the recording instead of sitting on it (Regen knob)
+//   air       tilt on the SURVIVING band, hinged below the wall: truncation
+//             darkens the balance of what is left, which is a separate defect
+//             from the missing band itself (Air knob)
 //   transient zero-lookahead attack boost masks pre-echo smear (Attack knob)
 //
 // THREE deficit factors derived from the corner scale the chain, so pristine
@@ -50,13 +55,16 @@
 // Regen is additionally skipped outright once corner*1.08 reaches the anchor --
 // injecting content nobody can hear is pure cost. See regenAudible.
 //
-// Channel roles (Windows 7.1: 0 FL 1 FR 2 FC 3 LFE 4 BL 5 BR 6 SL 7 SR):
-//   FL/FR  full chain            FC     speech-tuned: no transient shaper,
-//   SL/SR  cleanup + light regen        sibilance detector ducks the exciter
-//   BL/BR  cleanup + light regen  LFE   untouched passthrough
+// Channels (Windows 7.1: 0 FL 1 FR 2 FC 3 LFE 4 BL 5 BR 6 SL 7 SR) all get the
+// IDENTICAL chain. No role differentiation: ReGen runs first under Equalizer
+// APO, ahead of any upmixer, so it sees stereo or positional-mono game audio,
+// and in positional audio any sound can be in any channel -- treating surrounds
+// or centre differently would make a source change character as it pans.
+// LFE alone is passed through, on physical grounds rather than role ones: it
+// carries nothing above ~120 Hz and every repair stage here acts above 6 kHz.
 // Detection and dynamics gains are shared per pair so imaging never wanders.
 //
-// Params: 0 Cleanup  1 Smooth  2 Regen  3 Attack  4 Mix  5 Restore  6 Freeze(0/1)
+// Params: 0 Cleanup 1 Smooth 2 Regen 3 Air 4 Attack 5 Mix 6 Restore 7 Freeze(0/1)
 //
 // Build: see build_mingw.bat.  License: BSD-2-Clause.
 
@@ -77,9 +85,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static const VstInt32 kNumParams  = 7;
-static const int      kNumSliders = 6;                 // Freeze is a checkbox
-enum { P_CLEAN = 0, P_SMOOTH, P_REGEN, P_TRANS, P_MIX, P_RESTORE, P_FREEZE };
+static const VstInt32 kNumParams  = 8;
+static const int      kNumSliders = 7;                 // Freeze is a checkbox
+enum { P_CLEAN = 0, P_SMOOTH, P_REGEN, P_AIR, P_TRANS, P_MIX, P_RESTORE, P_FREEZE };
 
 enum { CH_FL = 0, CH_FR, CH_FC, CH_LFE, CH_BL, CH_BR, CH_SL, CH_SR };
 
@@ -89,6 +97,11 @@ enum { CH_FL = 0, CH_FR, CH_FC, CH_LFE, CH_BL, CH_BR, CH_SL, CH_SR };
 // is a pure CPU optimisation with no signal-level signature, so this is the only
 // way a test can assert it actually happens rather than merely not breaking.
 #define REGEN_DORMANT_QUERY CCONST('D', 'o', 'r', 'm')
+// index='Prss'/'Slop'/'Tonl', value=group -> that term x1000, so the restoration
+// stage can be tuned against measurements instead of inferred from output.
+#define REGEN_PRESSURE_QUERY CCONST('P', 'r', 's', 's')
+#define REGEN_SLOPE_QUERY    CCONST('S', 'l', 'o', 'p')
+#define REGEN_TONAL_QUERY    CCONST('T', 'o', 'n', 'l')
 
 // Control-rate block: adaptive coefficients and the servo update every
 // kCtrl samples (~1.3 ms at 48 kHz); per-sample cost stays pure filtering.
@@ -277,35 +290,77 @@ static const double kTrnSplitHz = 2000.0;   // transient LF/HF crossover
 // near-inaudible correction), 192k clearly engaged, 128k and below full.
 static const double kTrnGateOct = 0.40;     // octaves below ceiling -> full
 
+// ---------------------------------------------------- bandwidth restoration ----
+// The job here is RESTORATION, not correction: the codec destroyed the top
+// band, so there is nothing left up there to boost and synthesis is the whole
+// task. What separates convincing restoration from an obvious effect is not how
+// much is added but three properties of what gets added --
+//
+//   character  harmonics for tonal content, noise for noise-like content. The
+//              top octave of real music is mostly noise (cymbal wash, air,
+//              breath, transient edges); harmonic generation over that reads as
+//              fizz. Squaring the source band translates it up an OCTAVE and
+//              preserves whichever character it had, so it carries most of the
+//              load; a noise blend covers the rest. See kTonalCrest*.
+//   slope      continue the rolloff the source already has instead of filling
+//              flat, or the fill announces itself as a ledge at the corner.
+//   envelope   level from the surviving band's envelope, so the restored band
+//              breathes with the music instead of sitting under it as a static
+//              hiss bed.
+//
+// Above ~10 kHz the ear resolves band energy and its time envelope rather than
+// fine spectral structure, which is why an octave-translation this cheap can
+// stand in for real spectral band replication up there.
+static const double kSrcLoRel   = 0.50;   // source band = the surviving octave
+static const double kSrcHiRel   = 0.95;   // just below the wall
+static const double kInjHP      = 1.02;   // restored band starts just above it
+static const double kInjLP      = 1.95;   // ...and ends an octave up (x2 of src)
+static const double kRestCentreRel = 1.38;  // geometric centre of the restored band
+
+// Slope probes, as fractions of the corner. Roughly 0.9 octaves apart: wide
+// enough that the estimate is not dominated by one partial, close enough that
+// both sit in genuinely surviving content.
+static const double kSlopeLoRel = 0.42;
+static const double kSlopeHiRel = 0.78;
+static const double kSlopeDefaultDbOct = -12.0;  // used until the meters settle
+static const double kSlopeMinDbOct     = -30.0;  // floor; steeper reads as silence
+
+// Crest factor (peak/RMS) on the source band as a tonality proxy: a steady sine
+// sits at 1.41, noise runs 3-4. It is COARSE -- dense music also crests high --
+// so it steers a blend rather than switching, and the translation path (which
+// suits both characters) is what it blends toward.
+static const double kTonalCrestLo = 1.7;  // at or below -> fully tonal
+static const double kTonalCrestHi = 3.4;  // at or above -> fully noise-like
+
+// Air: tilt on the SURVIVING band, hinged below the wall. Truncation leaves the
+// balance dark, and that is a separate defect from the missing band itself --
+// this fixes the tilt with real content, restoration supplies the rest.
+static const double kAirHingeRel = 0.55;
+static const double kAirMaxDb    = 10.0;
+
+// How hard content must press against the wall before either stage trusts that
+// the encoder truncated something rather than the music simply being dark.
+// Calibrated, not guessed: a hard 10 kHz brickwall measures ~8 dB above the
+// servo's own alive threshold, so 8 dB is what full pressure means.
+//
+// This is a COARSE, slow term -- hLo is a 2.5 s peak-hold and the servo itself
+// drives it toward the threshold, so it mostly separates "bandlimited at all"
+// from "pinned at the corner floor" rather than tracking passages. Per-passage
+// restraint comes from the source-band envelope instead, which is exact: no
+// content in the surviving band means nothing to extrapolate from, so the
+// restored band goes quiet on its own.
+static const double kPressureSpanDb = 8.0;
+
 // Idle gate, shared by the plugin-wide gate and the per-group ones.
 static const double kGateThresh = 1e-5;     // ~-100 dBFS peak
 static const double kGateHold   = 0.25;     // seconds below thresh to sleep
 
-// Clamped Pade tanh: within ~1e-3 of tanh for |x|<3, hard 1 beyond. Plenty
-// for waveshaping and much cheaper than libm's tanh at 7 calls per sample.
-static inline double fastTanh(double x) {
-    if (x >  3.0) return  1.0;
-    if (x < -3.0) return -1.0;
-    double x2 = x * x;
-    return x * (27.0 + x2) / (27.0 + 9.0 * x2);
-}
-
-// Asymmetric soft saturator for the exciter: the bias term adds even
-// harmonics (2nd fills the octave right above the source band), tanh adds
-// odd. The DC offset it introduces dies in the injection highpass.
-static inline double shapeHF(double n) {
-    const double tb = 0.53704956699803528;   // tanh(0.6)
-    return fastTanh(1.6 * n + 0.6) - tb;
-}
-
-// ------------------------------------------------------------ role group ----
+// ---------------------------------------------------------------- group ----
 // A group is one detection unit: a stereo pair or a mono channel. Detection
 // runs on the pair's mono sum; time-varying GAINS derived from shared
 // envelopes are applied identically to both channels so imaging stays put.
 struct Group {
     int  chA = 0, chB = -1;               // chB < 0 -> mono group
-    bool useSmooth = false, useTrans = false, useDuck = false;
-    double exScale = 1.0;
 
     // --- rolloff servo ---
     Biquad refBP;                         // broad 1-4 kHz mid reference
@@ -317,7 +372,18 @@ struct Group {
     double damage  = 0;                   // 0 = pristine (servo pinned), 1 = wrecked
     double dSmooth = 0;                   // damage, but starting later (warble)
     double wClean  = 0;                   // audibility of cleanup's action band
-    double wRegen  = 0;                   // audibility of regen's injection band
+    double wRegen  = 0;                   // audibility of the restored band
+
+    // --- spectral slope, for continuing the source's own rolloff upward ---
+    // Two probes below the wall. Filling the restored band flat, or to a fixed
+    // level, leaves an audible ledge exactly at the corner -- which is what
+    // makes bandwidth extension sound bolted on. Measuring the slope the source
+    // already has and extrapolating it across the gap is what makes the
+    // synthesized band read as a continuation of the recording.
+    Biquad refSlopeLo, refSlopeHi;
+    double msSlopeLo = 0, msSlopeHi = 0;
+    double levelRatio = 0;                // restored-band level / source-band level
+    double pressure   = 0;                // how hard content presses against the wall
 
     // --- per-group idle gate ---
     // The plugin-wide gate keys off the peak across all EIGHT channels, so one
@@ -333,11 +399,30 @@ struct Group {
     Biquad    cleanLP[2];
     OnePoleLP smLP[2];                    // top-band split (hb = x - lp)
     EnvAR     hbFast, hbSlow;             // shared flutter envelopes
-    OnePoleLP ex3[2], ex8[2];             // 3-8 kHz exciter source band
-    Biquad    injHP[2][2];                // 4th-order injection highpass
-    EnvAR     midEnv;                     // shared level link
-    OnePoleLP dkLo1, dkLo2, dkHi1, dkHi2; // sibilance bands (center only)
-    EnvAR     envSib, envVoice;
+
+    // --- bandwidth restoration ---
+    // Source band is the surviving octave BELOW the wall (corner*0.5 ..
+    // corner*0.95), not a fixed 3-8 kHz: squaring translates it up an octave,
+    // landing it exactly in the empty region. A fixed source band only lines up
+    // at one corner and goes thin everywhere else.
+    OnePoleLP srcHP[2], srcLP[2];         // source band (bp = lp(x - hp(x)))
+    Biquad    injHP[2][2];                // 4th-order highpass into the gap
+    OnePoleLP injLP[2];                   // band-limit + tilt of the restored band
+    EnvAR     srcEnv;                     // shared level link
+    EnvAR     srcPeak;                    // shared, for the crest/tonality proxy
+    double    msSrc = 0;
+    double    tonal = 1.0;                // 1 = tonal (harmonic), 0 = noise-like
+    unsigned  rng[2] = { 22222u, 8675309u };  // decorrelated noise per channel
+
+    // --- air: corner-hinged tilt on the SURVIVING band ---
+    // Built as gain-on-a-highpass (x + g*hp) rather than a shelf biquad, so the
+    // gain moves per sample with no coefficient recompute and no zipper.
+    // 2nd-order rather than one-pole: a 6 dB/oct shelf has a long enough tail
+    // to put ~0.6 dB into the midrange at full tilt, which is a level change
+    // wearing a tone control's clothing. Truncation leaves the balance dark;
+    // this puts the tilt back using content that is really there, while the
+    // restoration above supplies the band that is not.
+    Biquad airHP[2];
 
     // --- transient restoration (fronts only), Crystalizer-shaped ---
     // TWO bands with independent detectors and independent gains. Pre-echo is
@@ -354,15 +439,9 @@ struct Group {
 
     void configure(double fs, double cornerMaxLog) {
         refBP.setBP(fs, 2000.0, 0.8);
-        for (int c = 0; c < 2; ++c) {
-            ex3[c].setCutoff(fs, 3000.0);
-            ex8[c].setCutoff(fs, 8000.0);
-        }
-        dkLo1.setCutoff(fs, 1000.0); dkLo2.setCutoff(fs, 3000.0);
-        dkHi1.setCutoff(fs, 5000.0); dkHi2.setCutoff(fs, 9000.0);
         hbFast.init(fs, 1.0, 15.0);   hbSlow.init(fs, 40.0, 80.0);
-        midEnv.init(fs, 4.0, 50.0);
-        envSib.init(fs, 3.0, 50.0);   envVoice.init(fs, 3.0, 50.0);
+        srcEnv.init(fs, 4.0, 50.0);
+        srcPeak.init(fs, 0.5, 200.0);
         trFastLo.init(fs, 0.5, 40.0); trSlowLo.init(fs, 15.0, 140.0);
         trFastHi.init(fs, 0.5, 40.0); trSlowHi.init(fs, 15.0, 140.0);
         trSplitD.setCutoff(fs, kTrnSplitHz);
@@ -376,17 +455,18 @@ struct Group {
 
     void resetSignalState() {         // clears audio state, keeps the learned corner
         refBP.reset(); probeLo.reset(); probeHi.reset();
+        refSlopeLo.reset(); refSlopeHi.reset();
         msRef = msLo = msHi = wideMS = 0.0;
+        msSlopeLo = msSlopeHi = msSrc = 0.0;
         for (int c = 0; c < 2; ++c) {
             cleanLP[c].reset(); smLP[c].reset();
-            ex3[c].reset(); ex8[c].reset();
-            injHP[c][0].reset(); injHP[c][1].reset();
+            srcHP[c].reset(); srcLP[c].reset();
+            injHP[c][0].reset(); injHP[c][1].reset(); injLP[c].reset();
+            airHP[c].reset();
         }
-        hbFast.reset(); hbSlow.reset(); midEnv.reset();
-        envSib.reset(); envVoice.reset();
+        hbFast.reset(); hbSlow.reset(); srcEnv.reset(); srcPeak.reset();
         trFastLo.reset(); trSlowLo.reset(); trFastHi.reset(); trSlowHi.reset();
         trSplitD.reset(); trSplitA[0].reset(); trSplitA[1].reset();
-        dkLo1.reset(); dkLo2.reset(); dkHi1.reset(); dkHi2.reset();
     }
 
     // Control-rate servo step + adaptive coefficient refresh.
@@ -421,18 +501,59 @@ struct Group {
         // there is inaudible however much of it we do. Ramps rather than hard
         // switches so two similar sources cannot fall either side of a cliff.
         wClean = clamp01((kAudIdleHz - corner * 1.25) / kAudSpanHz);
-        wRegen = clamp01((kAudIdleHz - corner * 1.08) / kAudSpanHz);
+        wRegen = clamp01((kAudIdleHz - corner * kInjHP) / kAudSpanHz);
+
+        // -- slope continuation --
+        // Measure the tilt the source already has across two probes below the
+        // wall, then extrapolate it to the centre of the restored band. The
+        // result is a RATIO against the source band's own level, so the
+        // injection tracks the music's envelope for free and only the tilt
+        // comes from this measurement.
+        {
+            double rLo = std::sqrt(msSlopeLo), rHi = std::sqrt(msSlopeHi);
+            double slopeDbOct = kSlopeDefaultDbOct;
+            if (rLo > 1e-9 && rHi > 1e-9) {
+                static const double spanOct =
+                    1.4426950408889634 * std::log(kSlopeHiRel / kSlopeLoRel);   // log2
+                slopeDbOct = 20.0 * std::log10(rHi / rLo) / spanOct;
+            }
+            // Clamp: a rising slope would extrapolate to a boost, and pathological
+            // content must not be able to drive the synthesized band above the
+            // real one it is supposed to continue from.
+            if (slopeDbOct >  0.0)            slopeDbOct =  0.0;
+            if (slopeDbOct < kSlopeMinDbOct)  slopeDbOct = kSlopeMinDbOct;
+            static const double extrapOct =
+                1.4426950408889634 * std::log(kRestCentreRel / kSlopeHiRel);
+            levelRatio = std::pow(10.0, slopeDbOct * extrapOct / 20.0);
+        }
+
+        // -- wall pressure --
+        // Is content actually pressed up against the corner, or did it roll off
+        // on its own well below it? Only the first case implies the encoder
+        // truncated something. Without this, a dark passage gets its coarsely
+        // quantized top band lifted -- boosting encoder noise, not music.
+        {
+            double th = hRef * 2.5e-4 + 1e-12;
+            double relDb = 10.0 * std::log10((hLo + 1e-15) / th);
+            pressure = clamp01(relDb / kPressureSpanDb);
+        }
 
         if (std::fabs(cornerLog - appliedLog) > 5e-4) {
             appliedLog = cornerLog;
             probeLo.set(fs, corner);
             probeHi.set(fs, std::min(corner * 1.30, fs * 0.47));
+            refSlopeLo.setBP(fs, corner * kSlopeLoRel, 1.4);
+            refSlopeHi.setBP(fs, corner * kSlopeHiRel, 1.4);
             int nch = (chB >= 0) ? 2 : 1;
             for (int c = 0; c < nch; ++c) {
                 cleanLP[c].setLP(fs, corner * 1.25, 0.7071);
-                injHP[c][0].setHP(fs, corner * 1.08, 0.5412);
-                injHP[c][1].setHP(fs, corner * 1.08, 1.3066);
+                injHP[c][0].setHP(fs, corner * kInjHP, 0.5412);
+                injHP[c][1].setHP(fs, corner * kInjHP, 1.3066);
+                injLP[c].setCutoff(fs, std::min(corner * kInjLP, fs * 0.45));
+                srcHP[c].setCutoff(fs, corner * kSrcLoRel);
+                srcLP[c].setCutoff(fs, corner * kSrcHiRel);
                 smLP[c].setCutoff(fs, corner * 0.55);
+                airHP[c].setHP(fs, corner * kAirHingeRel, 0.7071);
             }
         }
     }
@@ -441,7 +562,7 @@ struct Group {
     // (only ours are touched); dry[] is the untouched input. kMS100/kMS200 are
     // the meter one-pole coefficients; cln/smo/reg/trn are the smoothed knobs.
     inline void tick(double* x, const double* dry, double kMS100, double kMS200,
-                     double cln, double smo, double reg, double trn) {
+                     double cln, double smo, double reg, double trn, double air) {
         int a = chA, b = chB;
 
         // -- per-group idle gate --
@@ -470,6 +591,8 @@ struct Group {
         double r  = refBP.process(m);   msRef += kMS200 * (r * r - msRef);
         double lo = probeLo.process(m); msLo  += kMS200 * (lo * lo - msLo);
         double hi = probeHi.process(m); msHi  += kMS200 * (hi * hi - msHi);
+        double sl = refSlopeLo.process(m); msSlopeLo += kMS200 * (sl * sl - msSlopeLo);
+        double sh = refSlopeHi.process(m); msSlopeHi += kMS200 * (sh * sh - msSlopeHi);
 
         // -- cleanup: bury swirl/hash just above the corner --
         // Gated like the stages below rather than run-and-multiply-by-zero: at
@@ -487,7 +610,7 @@ struct Group {
         // Skipped when its gain is zero (pristine content / knob down); the
         // gain ramps continuously through zero, so re-engaging never clicks
         // even though the envelopes restart cold.
-        if (useSmooth && smo * dSmooth > 1e-3) {
+        if (smo * dSmooth > 1e-3) {
             double hbA = xa - smLP[0].process(xa);
             double hbB = (b >= 0) ? xb - smLP[1].process(xb) : 0.0;
             double he  = (b >= 0) ? 0.5 * (std::fabs(hbA) + std::fabs(hbB))
@@ -501,28 +624,56 @@ struct Group {
             if (b >= 0) xb += (ge - 1.0) * hbB;
         }
 
-        // -- regeneration: harmonics from 3-8 kHz, injected above the corner --
-        // Also gain-gated like the smoother: envelopes restart cold on
-        // re-engage but the add ramps up from zero, so no click.
-        double gEx = reg * exScale * damage * wRegen * 1.2;
-        if (gEx > 1e-3) {
-            double bpA = ex8[0].process(xa - ex3[0].process(xa));
-            double bpB = (b >= 0) ? ex8[1].process(xb - ex3[1].process(xb)) : 0.0;
+        // -- bandwidth restoration: synthesize the band the codec destroyed --
+        // Gain-gated like the smoother: envelopes restart cold on re-engage but
+        // the add ramps up from zero, so no click.
+        double gRes = reg * damage * wRegen * pressure;
+        if (gRes > 1e-3) {
+            // Source band: the surviving octave below the wall.
+            double bpA = srcLP[0].process(xa - srcHP[0].process(xa));
+            double bpB = (b >= 0) ? srcLP[1].process(xb - srcHP[1].process(xb)) : 0.0;
             double ae  = (b >= 0) ? 0.5 * (std::fabs(bpA) + std::fabs(bpB))
                                   : std::fabs(bpA);
-            double me  = midEnv.next(ae);
-            if (useDuck) {   // duck the exciter on /s/ so dialogue doesn't spit
-                double v  = dkLo2.process(xa) - dkLo1.process(xa);   // 1-3 kHz
-                double s  = dkHi2.process(xa) - dkHi1.process(xa);   // 5-9 kHz
-                double rv = envVoice.next(std::fabs(v));
-                double rs = envSib.next(std::fabs(s));
-                double rr = rs / (rv + 1e-6);
-                gEx *= 1.0 / (1.0 + 3.0 * std::max(0.0, rr - 0.7));
+            double se  = srcEnv.next(ae);
+
+            // Tonality from crest factor, shared so the pair blends identically.
+            double pk = srcPeak.next(ae);
+            msSrc += 0.001 * (ae * ae - msSrc);
+            double crest = pk / (std::sqrt(msSrc) + 1e-9);
+            tonal = clamp01((kTonalCrestHi - crest) /
+                            (kTonalCrestHi - kTonalCrestLo));
+
+            double nrm = 1.0 / (1.4142 * se + 3e-4);
+            double lvl = se * levelRatio * gRes;
+
+            for (int i = 0; i < ((b >= 0) ? 2 : 1); ++i) {
+                double n = ((i == 0) ? bpA : bpB) * nrm;
+                // Translation path: squaring shifts the band up an octave and
+                // keeps its character, tonal or noisy, unlike a tanh whose odd
+                // harmonics pile intermodulation into dense material. The DC
+                // and difference terms it also produces die in the injection
+                // highpass. x2 restores unit-ish RMS after squaring.
+                double xlate = 2.0 * n * n;
+                // Noise path: white, so it carries no structure of its own, and
+                // it is the envelope and slope that make it belong.
+                rng[i] = rng[i] * 1664525u + 1013904223u;
+                double nz = 1.73 * ((double)(rng[i] >> 8) / 8388608.0 - 1.0);
+                double gen = tonal * xlate + (1.0 - tonal) * nz;
+                gen = injHP[i][1].process(injHP[i][0].process(gen));
+                gen = injLP[i].process(gen);
+                if (i == 0) xa += gen * lvl; else xb += gen * lvl;
             }
-            double nrm = 1.0 / (1.4142 * me + 3e-4);   // normalize, shape, re-link
-            xa += injHP[0][1].process(injHP[0][0].process(shapeHF(bpA * nrm))) * me * gEx;
-            if (b >= 0)
-                xb += injHP[1][1].process(injHP[1][0].process(shapeHF(bpB * nrm))) * me * gEx;
+        }
+
+        // -- air: put the tilt back, using content that is really there --
+        // Separate defect from the missing band: truncation darkens the balance
+        // of what SURVIVED. Gain-on-a-highpass so the gain moves per sample with
+        // no coefficient recompute and no zipper.
+        double gAirDb = air * damage * pressure * kAirMaxDb;
+        if (gAirDb > 0.05) {
+            double gAir = std::pow(10.0, gAirDb / 20.0) - 1.0;
+            xa += gAir * airHP[0].process(xa);
+            if (b >= 0) xb += gAir * airHP[1].process(xb);
         }
 
         // -- transient restoration: per-band onset boost --
@@ -533,7 +684,7 @@ struct Group {
         // that produces pre-echo ("a sharp attack beginning near the end of a
         // transform block immediately following a region of low energy") and
         // also where backward masking has least to work with.
-        if (useTrans && trn * damage > 1e-3) {
+        if (trn * damage > 1e-3) {
             double dm  = (b >= 0) ? 0.5 * (dry[a] + dry[b]) : dry[a];
             double dLo = trSplitD.process(dm);
             double dHi = dm - dLo;
@@ -552,7 +703,7 @@ struct Group {
             double gHi = 1.0 + tEff * 0.8 * onH;  if (gHi > 2.0) gHi = 2.0;
 
             // The application split runs unconditionally so its state stays
-            // warm (two one-poles, and only the front group sets useTrans), but
+            // warm (two one-poles), but
             // the recombine is skipped when neither band is lifting: steady
             // material then stays bit-exact, since lo + (x - lo) is not
             // guaranteed to round-trip exactly in floating point.
@@ -719,7 +870,7 @@ struct ReGen {
     double stepUp = 0, stepDown = 0, holdAtt = 0, holdRel = 0;
     double cornerMinLog = 0, cornerMaxLog = 0;
 
-    Smooth smClean, smSmooth, smRegen, smTrans, smMix, smRestore;
+    Smooth smClean, smSmooth, smRegen, smAir, smTrans, smMix, smRestore;
 
 #if defined(_WIN32)
     HWND edContainer = nullptr;
@@ -749,6 +900,10 @@ struct ReGen {
         params[P_CLEAN]  = 0.7f;
         params[P_SMOOTH] = 0.5f;
         params[P_REGEN]  = 0.6f;
+        // Air is tilt, which is the most audible thing here and the easiest to
+        // overdo. Start it modest -- it is also gated by wall pressure, so on
+        // material that was never truncated it contributes nothing anyway.
+        params[P_AIR]    = 0.4f;
         // 0.35, not the 0.5 that ReGen-retro-defaults.md offers as its
         // alternative: that branch was conditioned on Attack self-disabling on
         // content that does not need it. Removing the corner dependence gives
@@ -773,19 +928,26 @@ struct ReGen {
         cornerMinLog = std::log2(6000.0);
         cornerMaxLog = std::log2(std::min(20000.0, 0.44 * fs));
 
+        // Every group runs the identical chain. Role-based differentiation --
+        // a speech-tuned centre, scaled-down surrounds -- was a home-theatre
+        // film idea and it is wrong here twice over. ReGen runs FIRST under
+        // Equalizer APO, ahead of any upmixer, so what it actually sees is
+        // stereo or positional-mono game audio and the role logic never fires.
+        // Worse, when it does fire it is actively harmful: in positional audio
+        // any sound can be in any channel, so treating surrounds more gently
+        // makes a source change character as it pans front to back. Grouping
+        // now exists only to share gains (so imaging cannot wander) and to let
+        // idle pairs sleep independently.
         groups[G_FRONT]  = Group{}; groups[G_FRONT].chA  = CH_FL; groups[G_FRONT].chB  = CH_FR;
-        groups[G_FRONT].useSmooth = true; groups[G_FRONT].useTrans = true;
         groups[G_CENTER] = Group{}; groups[G_CENTER].chA = CH_FC;
-        groups[G_CENTER].useSmooth = true; groups[G_CENTER].useDuck = true;
         groups[G_SIDE]   = Group{}; groups[G_SIDE].chA   = CH_SL; groups[G_SIDE].chB   = CH_SR;
-        groups[G_SIDE].exScale = 0.6;
         groups[G_BACK]   = Group{}; groups[G_BACK].chA   = CH_BL; groups[G_BACK].chB   = CH_BR;
-        groups[G_BACK].exScale = 0.6;
         for (int g = 0; g < kNumGroups; ++g) groups[g].configure(fs, cornerMaxLog);
 
         smClean.init(fs, 30.0, params[P_CLEAN]);
         smSmooth.init(fs, 30.0, params[P_SMOOTH]);
         smRegen.init(fs, 30.0, params[P_REGEN]);
+        smAir.init(fs, 30.0, params[P_AIR]);
         smTrans.init(fs, 30.0, params[P_TRANS]);
         smMix.init(fs, 30.0, params[P_MIX]);
         smRestore.init(fs, 30.0, params[P_RESTORE]);
@@ -871,7 +1033,7 @@ struct ReGen {
                 ctrlCount = 0;                     // apply coefficients now
                 smClean.snap(params[P_CLEAN]);  smSmooth.snap(params[P_SMOOTH]);
                 smRegen.snap(params[P_REGEN]);  smTrans.snap(params[P_TRANS]);
-                smMix.snap(params[P_MIX]);
+                smAir.snap(params[P_AIR]);      smMix.snap(params[P_MIX]);
             } else if (peak < kGateThresh) {
                 if (++silentRun >= hang) {
                     // Decaying state has flushed to ~0 by now; make it exact.
@@ -889,11 +1051,12 @@ struct ReGen {
             double cln = smClean.next(params[P_CLEAN]);
             double smo = smSmooth.next(params[P_SMOOTH]);
             double reg = smRegen.next(params[P_REGEN]);
+            double air = smAir.next(params[P_AIR]);
             double trn = smTrans.next(params[P_TRANS]);
             double mix = smMix.next(params[P_MIX]);
 
             for (int g = 0; g < kNumGroups; ++g)
-                groups[g].tick(x, dry, kMS100, kMS200, cln, smo, reg, trn);
+                groups[g].tick(x, dry, kMS100, kMS200, cln, smo, reg, trn, air);
 
             for (int c = 0; c < 8; ++c) {
                 if (!out[c]) continue;
@@ -908,7 +1071,8 @@ struct ReGen {
 
 // ------------------------------------------------------------- editor GUI ----
 #if defined(_WIN32)
-static VstRect g_edRect = { 0, 0, 378, 460 };
+// {top, left, bottom, right} -- height must clear kNumSliders*48 + the Freeze row.
+static VstRect g_edRect = { 0, 0, 426, 460 };
 
 enum { kResetId = 200, kFreezeId = 201, kStatusTimer = 1 };
 
@@ -984,7 +1148,6 @@ void ReGen::openEditor(HWND parent) {
 
     static const char* kClass = "ReGenEditorWnd";
     WNDCLASSEXA wc;
-    ZeroMemory(&wc, sizeof wc);
     wc.cbSize = sizeof wc;               // GetClassInfoExA requires this preset
     if (!GetClassInfoExA(inst, kClass, &wc)) {
         ZeroMemory(&wc, sizeof wc);
@@ -1010,7 +1173,8 @@ void ReGen::openEditor(HWND parent) {
                     374, 6, 74, 22, edContainer,
                     (HMENU)(intptr_t)kResetId, inst, nullptr);
 
-    const char* names[kNumSliders] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix", "Restore" };
+    const char* names[kNumSliders] = { "Cleanup", "Smooth", "Regen", "Air",
+                                       "Attack", "Mix", "Restore" };
     for (int i = 0; i < kNumSliders; ++i) {
         int y = 40 + i * 48;
         CreateWindowExA(0, "STATIC", names[i], WS_CHILD | WS_VISIBLE,
@@ -1161,11 +1325,11 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
         if (index < 0 || index >= kNumParams) { copyStr(ptr, "", kMaxParamStr); return 0; }
         if (opcode == effGetParamName) {
             // Must fit kVstMaxParamStrLen (8 bytes -> 7 chars).
-            const char* names[] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix",
-                                    "Restore", "Freeze" };
+            const char* names[] = { "Cleanup", "Smooth", "Regen", "Air", "Attack",
+                                    "Mix", "Restore", "Freeze" };
             copyStr(ptr, names[index], kMaxParamStr);
         } else if (opcode == effGetParamLabel) {
-            const char* labels[] = { "%", "%", "%", "%", "%", "%", "" };
+            const char* labels[] = { "%", "%", "%", "%", "%", "%", "%", "" };
             copyStr(ptr, labels[index], kMaxParamStr);
         } else { // display
             if (index == P_FREEZE) {
@@ -1191,6 +1355,12 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
             VstIntPtr m = 0;
             for (int g = 0; g < kNumGroups; ++g) if (p->groups[g].dormant) m |= (1 << g);
             return m;
+        }
+        if (p && (int)value >= 0 && (int)value < kNumGroups) {
+            const Group& g = p->groups[(int)value];
+            if (index == REGEN_PRESSURE_QUERY) return (VstIntPtr)std::lround(g.pressure   * 1000.0);
+            if (index == REGEN_SLOPE_QUERY)    return (VstIntPtr)std::lround(g.levelRatio * 1000.0);
+            if (index == REGEN_TONAL_QUERY)    return (VstIntPtr)std::lround(g.tonal      * 1000.0);
         }
         return 0;
 

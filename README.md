@@ -1,4 +1,4 @@
-# ReGen — lossy-audio reconstruction for Equalizer APO and DAW
+# ReGen — lossy-audio reconstruction for Equalizer APO
 
 A 64-bit VST2 plugin that cleans up and partially reconstructs lossy/legacy
 game audio: low-sample-rate ADPCM sound effects, 128 kbps MP3 soundtracks,
@@ -24,9 +24,19 @@ different corners — and everything downstream keys off that one measurement:
   codec swirl and quantization hash. Gentle slope so it reads as smoothness.
 - **Smooth** — envelope-ratio gain on the top octave clamps warbly level
   flutter (attenuate-only, so stable content is untouched).
-- **Regen** — the 3–8 kHz band is soft-saturated to generate harmonics, then
-  highpassed *above the detected corner* and mixed back in, level-linked to
-  the real midrange envelope so quiet passages don't hiss.
+- **Regen** — **restores** the band the codec destroyed. The surviving octave
+  below the wall is squared, which translates it up an octave, then highpassed
+  into the empty region. Squaring rather than saturating matters: it keeps tonal
+  content tonal and noise-like content noisy, where a tanh's odd harmonics pile
+  intermodulation into dense material and read as fizz. The level comes from
+  extrapolating the source's *own* spectral slope across the gap, so the
+  synthesized band continues the recording instead of sitting on top of it as a
+  flat ledge — and it is scaled by the surviving band's envelope, so it breathes
+  with the music rather than becoming a static hiss bed.
+- **Air** — tilt on the band that *survived*, hinged below the wall.
+  Truncation doesn't only remove the top, it darkens the balance of everything
+  left behind, and that is a separate defect needing a separate fix. This one
+  invents nothing: it lifts content that is genuinely there.
 - **Attack** — two-band transient restoration. Independent onset detectors and
   independent gains below and above 2 kHz, in the lineage of the X-Fi
   Crystalizer (which ran separate low- and high-frequency energy flux with
@@ -58,15 +68,24 @@ The smoother is the exception: its band (from `corner × 0.55`) is always
 audible, but warble is a *bit-starvation* artifact that doesn't exist at high
 bitrate, so it starts later — 0.20 octaves below the ceiling rather than at it.
 
-| source | corner | damage | Cleanup | Regen | Smooth | Attack |
-|---|---|---|---|---|---|---|
-| lossless (48k or CD) | 20000 Hz | 0.00 | 0.00 | 0.00 | 0.00 | **0.00** |
-| high-quality Ogg | 19114 Hz | 0.16 | 0.00 | 0.00 | 0.00 | 0.16 |
-| 320k MP3 | 17772 Hz | 0.43 | 0.00 | 0.00 | 0.00 | 0.43 |
-| 192k MP3 | 16767 Hz | 0.64 | 0.00 | 0.00 | 0.27 | 0.64 |
-| 128k MP3 | 14843 Hz | 1.00 | 0.00 | 0.16 | 1.00 | 1.00 |
-| 22 kHz ADPCM | 10423 Hz | 1.00 | **1.00** | **1.00** | 1.00 | 1.00 |
-| retro mix (128k + ADPCM) | 14435 Hz | 1.00 | 0.00 | 0.30 | 1.00 | 1.00 |
+| source | corner | damage | Cleanup | Regen | Air | Smooth | Attack |
+|---|---|---|---|---|---|---|---|
+| lossless (48k or CD) | 20000 Hz | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | **0.00** |
+| high-quality Ogg | 19114 Hz | 0.16 | 0.00 | 0.00 | 0.16 | 0.00 | 0.16 |
+| 320k MP3 | 17772 Hz | 0.43 | 0.00 | 0.00 | 0.43 | 0.00 | 0.43 |
+| 192k MP3 | 16767 Hz | 0.64 | 0.00 | 0.00 | 0.64 | 0.27 | 0.64 |
+| 128k MP3 | 14843 Hz | 1.00 | 0.00 | 0.45 | 1.00 | 1.00 | 1.00 |
+| 22 kHz ADPCM | 10423 Hz | 1.00 | **1.00** | **1.00** | **1.00** | 1.00 | 1.00 |
+| retro mix (128k + ADPCM) | 14435 Hz | 1.00 | 0.00 | 0.58 | 1.00 | 1.00 | 1.00 |
+
+Air and Regen carry one further factor not shown, because it depends on content
+rather than on the corner: **wall pressure**. It asks whether energy is actually
+pressed up against the corner — meaning the encoder truncated something — or
+whether the music simply rolled off on its own well below it. A hard brickwall
+measures ~8 dB above the servo's own alive threshold and reads 1.00; content
+pinned at the 6 kHz corner floor reads near zero and neither stage fires. It is
+a coarse, slow term; moment-to-moment restraint comes from the source-band
+envelope, which is exact.
 
 Cleanup and regen concentrating on the *narrow-band* sources is not a
 regression — it is `ReGen-retro-defaults.md`'s own diagnosis, now enforced in
@@ -96,17 +115,25 @@ transients* — verified `max |out−in| = 0` over 25 s of burst-laden material
 below the clip knee. This is deliberately **not** full Crystalizer emulation,
 which enhanced everything unconditionally.
 
-## Channel roles (Windows 7.1 order: FL FR FC LFE BL BR SL SR)
+## Channels (Windows 7.1 order: FL FR FC LFE BL BR SL SR)
 
-| Role | Treatment |
-|---|---|
-| FL/FR | full chain |
-| FC | speech-tuned: no transient shaper; a sibilance detector ducks the exciter on /s/ so dialogue doesn't spit |
-| SL/SR, BL/BR | cleanup + lighter regeneration (they mostly carry ambience) |
-| LFE | untouched passthrough |
+**Every channel gets the identical chain.** There is deliberately no role
+differentiation — no speech-tuned centre, no scaled-down surrounds.
+
+Two reasons. ReGen runs *first* under Equalizer APO, ahead of any upmixer, so
+what it actually sees is stereo or positional-mono game audio and role logic
+would almost never fire. And where it did fire it would be actively harmful: in
+positional audio any sound can be in any channel, so treating surrounds more
+gently makes a source **change character as it pans front to back**. That is
+positional timbre inconsistency — an artifact the plugin would be introducing,
+which is worse than leaving the channel alone.
+
+LFE is the one exception, and it is passed through on physical grounds rather
+than role ones: it carries nothing above ~120 Hz, and every repair stage here
+acts above 6 kHz, so processing it is provably a no-op.
 
 Detection and time-varying gains are shared per pair (FL+FR, SL+SR, BL+BR) so
-imaging never wanders; only static per-channel filtering differs.
+imaging never wanders, and each pair sleeps independently when idle.
 
 ## Parameters
 
@@ -114,15 +141,18 @@ imaging never wanders; only static per-channel filtering differs.
 |---|---|---|
 | Cleanup | 70 % | dry/filtered mix of the adaptive lowpass |
 | Smooth | 50 % | top-octave flutter clamping |
-| Regen | 60 % | synthesized-highs level |
+| Regen | 60 % | level of the restored (synthesized) band above the wall |
+| Air | 40 % | tilt on the surviving band, up to +10 dB, hinged at `corner × 0.55` |
 | Attack | 35 % | two-band transient restoration (up to +6 dB) |
 | Mix | 100 % | global dry/wet — the safety valve |
 | Restore | **0 %** | lookahead pre-echo suppression — see below. Costs 32 ms of latency, so it is **refused under Equalizer APO** and reads `n/a` there |
 | Freeze | Off | locks the detector — **leave off** unless you know why (see below) |
 
-The editor's status line shows the live detected rolloff per group
-(Front / Center / Side / Back, in kHz) — watch it settle for a few seconds
-after audio starts. **Defaults** restores everything.
+The editor's status line shows the detected rolloff per group
+(Front / Center / Side / Back, in kHz). **This is only live in a DAW** — Equalizer
+APO's Configuration Editor instantiates a separate copy of the plugin to draw
+the GUI, so under EAPO that line never sees your audio and stays at its startup
+value. **Defaults** restores everything.
 
 The defaults target the common late-90s/2000s PC case: a compressed soundtrack
 (128k MP3, early Ogg/XMA) mixed with a 22 kHz ADPCM effects bank. Because the
@@ -248,3 +278,14 @@ trap.
 `effVendorSpecific` with index `'Roff'` and value 0–3 (front/center/side/back)
 returns that group's detected corner in Hz — used by the test host, handy for
 scripted verification.
+
+Three further queries return the restoration stage's internal terms as
+*value × 1000*, so it can be tuned against measurements instead of inferred from
+the output: `'Prss'` (wall pressure), `'Slop'` (extrapolated level ratio for the
+restored band) and `'Tonl'` (tonality, 1 = tonal, 0 = noise-like). `'Dorm'`
+returns a bitmask of sleeping groups.
+
+**Note:** these are the only way to observe the detector. Equalizer APO's
+Configuration Editor instantiates a *separate* copy of the plugin to draw its
+GUI, so the editor's rolloff status line never sees your audio and sits at its
+startup value — it is only live in a DAW.
