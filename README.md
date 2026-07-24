@@ -1,4 +1,4 @@
-# ReGen — lossy-audio reconstruction for Equalizer APO
+# ReGen — lossy-audio reconstruction for Equalizer APO and DAW
 
 A 64-bit VST2 plugin that cleans up and partially reconstructs lossy/legacy
 game audio: low-sample-rate ADPCM sound effects, 128 kbps MP3 soundtracks,
