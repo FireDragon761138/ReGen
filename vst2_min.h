@@ -135,7 +135,9 @@ enum {
 // ---- audioMaster opcodes (plugin -> host) ----
 enum {
     audioMasterAutomate = 0,    // index=param, opt=value: host records automation
-    audioMasterVersion  = 1
+    audioMasterVersion  = 1,
+    audioMasterIOChanged     = 13,  // latency/IO changed: host must re-negotiate
+    audioMasterGetProductString = 33 // ptr=char[64]: host's own name
 };
 
 #endif // VST2_MIN_H

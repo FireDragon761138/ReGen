@@ -23,8 +23,25 @@
 #endif
 
 #define REGEN_ROLLOFF_QUERY CCONST('R', 'o', 'f', 'f')
+#define REGEN_DORMANT_QUERY CCONST('D', 'o', 'r', 'm')
 
-static VstIntPtr VSTCALLBACK_master(AEffect*, VstInt32, VstInt32, VstIntPtr, void*, float) { return 0; }
+// This harness exists to emulate Equalizer APO, so it says so -- which also
+// exercises the path where Restore refuses to add latency a host cannot
+// compensate. VSTCALLBACK_daw is the opposite case.
+static VstIntPtr VSTCALLBACK_master(AEffect*, VstInt32 op, VstInt32, VstIntPtr,
+                                    void* ptr, float) {
+    if (op == audioMasterGetProductString && ptr) {
+        std::strcpy((char*)ptr, "Equalizer APO"); return 1;
+    }
+    return 0;
+}
+static VstIntPtr VSTCALLBACK_daw(AEffect*, VstInt32 op, VstInt32, VstIntPtr,
+                                 void* ptr, float) {
+    if (op == audioMasterGetProductString && ptr) {
+        std::strcpy((char*)ptr, "TestDAW"); return 1;
+    }
+    return 0;
+}
 typedef AEffect* (*EntryProc)(audioMasterCallback);
 
 // Goertzel magnitude of frequency f in buffer.
@@ -61,12 +78,26 @@ static void setParams(AEffect* fx, float clean, float smooth, float regen,
                       float trans, float mix, float freeze) {
     fx->setParameter(fx, 0, clean);  fx->setParameter(fx, 1, smooth);
     fx->setParameter(fx, 2, regen);  fx->setParameter(fx, 3, trans);
-    fx->setParameter(fx, 4, mix);    fx->setParameter(fx, 5, freeze);
+    fx->setParameter(fx, 4, mix);    fx->setParameter(fx, 6, freeze);
 }
 
 static long corner(AEffect* fx, int group) {
     return (long)fx->dispatcher(fx, effVendorSpecific, REGEN_ROLLOFF_QUERY,
                                 group, nullptr, 0);
+}
+
+// A virgin instance. The gated peak-hold meters (hRef/hLo/hHi) deliberately
+// survive resetSignalState() -- they are what keeps silence from dragging the
+// corner around -- so once full-band content has pumped hHi up, a later test
+// cannot retrain the corner downward in any reasonable time. Tests that need a
+// known servo state must therefore start from a fresh effect, not inherit one.
+static AEffect* freshFx(EntryProc entry) {
+    AEffect* fx = entry(VSTCALLBACK_master);
+    fx->dispatcher(fx, effOpen, 0, 0, nullptr, 0);
+    fx->dispatcher(fx, effSetSampleRate, 0, 0, nullptr, (float)fs);
+    fx->dispatcher(fx, effSetBlockSize, 0, 512, nullptr, 0);
+    fx->dispatcher(fx, effMainsChanged, 0, 1, nullptr, 0);
+    return fx;
 }
 
 // Fill fronts (+ scaled surrounds, center, LFE) with a multitone. `walled`
@@ -282,6 +313,16 @@ int main() {
         if (!zero) { printf("FAIL: gate not exact-zero in silence\n"); ok = false; }
         if (after != before) { printf("FAIL: corner changed across dormancy\n"); ok = false; }
 
+        // Freeze must survive dormancy. Only a pipeline restart auto-clears it;
+        // a paused game going digitally silent must not uncheck the user's own
+        // setting mid-session. The corner check above cannot catch this on its
+        // own -- a dormant group runs no servo, so a silently cleared Freeze
+        // still leaves the corner parked, and the regression hides until audio
+        // returns and the corner walks off.
+        float frz = fx->getParameter(fx, 6);
+        printf("gate : Freeze across dormancy = %.0f (expect 1)\n", frz);
+        if (frz < 0.5f) { printf("FAIL: silence gate cleared Freeze\n"); ok = false; }
+
         Buffers b2((int)fs);                       // tone starts at sample 1000
         for (int i = 1000; i < b2.n; ++i) {
             float v = 0.2f * (float)std::sin(2.0 * M_PI * 1000.0 * (i - 1000) / fs);
@@ -296,6 +337,241 @@ int main() {
             printf("FAIL: wake not sample-accurate\n"); ok = false;
         }
         if (!finite8(b2)) { printf("FAIL: non-finite output\n"); ok = false; }
+    }
+
+    // --- per-group idle gate: a group with no input sleeps on its own pair,
+    //     keeps its learned corner parked while other groups move, and wakes
+    //     sample-accurately. Regression guard for the plugin-wide gate being
+    //     the only one (which made silent channels cost full price). ---
+    {
+        AEffect* gx = freshFx(entry);
+        setParams(gx, 0.7f, 0.5f, 0.6f, 0.35f, 1, 0);
+        Buffers train(8 * (int)fs);                 // train ALL groups down
+        fillSignal(train, true);                    // (down-slew is deliberately slow)
+        process(gx, train);
+        long frontTrained = corner(gx, 0);
+        long sideTrained = corner(gx, 2), backTrained = corner(gx, 3);
+
+        // Fronts now get FULL-BAND content while the surrounds get nothing.
+        // The front corner must climb; the sleeping groups must not budge.
+        Buffers fo(2 * (int)fs);
+        const double fAll[] = { 500, 2400, 6000, 10000, 12500, 16000, 19000 };
+        for (int i = 0; i < fo.n; ++i) {
+            double t = i / fs, v = 0.0;
+            for (double f : fAll) v += 0.10 * std::sin(2.0 * M_PI * f * t);
+            fo.in[0][i] = fo.in[1][i] = (float)v;   // FL/FR only; 2..7 stay zero
+        }
+        process(gx, fo);
+        long frontMoved = corner(gx, 0);
+        long sideParked = corner(gx, 2), backParked = corner(gx, 3);
+
+        // Tails from the training pass decay for the first 250 ms (the hold),
+        // as with the plugin-wide gate; require exact zero once asleep.
+        bool quiet = true;
+        for (int c = 4; c < kCh; ++c)
+            for (int i = fo.n / 2; i < fo.n; ++i)
+                if (fo.out[c][i] != 0.0f) quiet = false;
+
+        long dorm = (long)gx->dispatcher(gx, effVendorSpecific,
+                                         REGEN_DORMANT_QUERY, 0, nullptr, 0);
+        printf("group: front %ld->%ld while side %ld->%ld back %ld->%ld (parked), "
+               "dormant mask=0x%lx\n",
+               frontTrained, frontMoved, sideTrained, sideParked,
+               backTrained, backParked, dorm);
+        // bit0 front (must be awake), bits 1..3 center/side/back (must sleep)
+        if (dorm != 0xE) {
+            printf("FAIL: expected groups 1-3 asleep and front awake (0xE)\n");
+            ok = false;
+        }
+        if (frontMoved < 17000) {
+            printf("FAIL: front group stopped tracking\n"); ok = false;
+        }
+        if (sideTrained > 17000) {
+            printf("FAIL: training left nothing to prove (side already at ceiling)\n");
+            ok = false;
+        }
+        if (sideParked != sideTrained || backParked != backTrained) {
+            printf("FAIL: dormant group's corner drifted\n"); ok = false;
+        }
+        if (!quiet) { printf("FAIL: silent group did not pass through clean\n"); ok = false; }
+
+        // Wake the sides mid-stream; fronts stay active throughout.
+        Buffers wk((int)fs);
+        for (int i = 0; i < wk.n; ++i) {
+            double t = i / fs;
+            float v = (float)(0.2 * std::sin(2.0 * M_PI * 1000.0 * t));
+            wk.in[0][i] = wk.in[1][i] = v;
+            if (i >= 1000)
+                wk.in[6][i] = wk.in[7][i] =
+                    (float)(0.2 * std::sin(2.0 * M_PI * 1000.0 * (i - 1000) / fs));
+        }
+        process(gx, wk);
+        int firstSide = -1;
+        for (int i = 0; i < wk.n; ++i)
+            if (std::fabs(wk.out[6][i]) > 1e-4f) { firstSide = i; break; }
+        printf("group: side wake first-output sample %d (tone starts 1000)\n", firstSide);
+        if (firstSide < 1000 || firstSide > 1010) {
+            printf("FAIL: per-group wake not sample-accurate\n"); ok = false;
+        }
+        if (!finite8(wk)) { printf("FAIL: non-finite output\n"); ok = false; }
+        gx->dispatcher(gx, effClose, 0, 0, nullptr, 0);
+    }
+
+    // --- transient band separation: the boost must stay in the band that
+    //     actually has the onset. A single broadband detector/gain fails this
+    //     (measured +0.25 dB on an HF transient over bass, vs +0.31 dB on the
+    //     steady bass it was supposed to leave alone). ---
+    {
+        AEffect* bx = freshFx(entry);
+        Buffers train(8 * (int)fs);                 // corner down, then freeze
+        fillSignal(train, true);
+        setParams(bx, 0, 0, 0, 1, 1, 0);            // Attack alone, servo live
+        process(bx, train);
+        long cTrain = corner(bx, 0);
+        setParams(bx, 0, 0, 0, 1, 1, 1);            // freeze: damage now provable
+        if (cTrain > 17000) {
+            printf("FAIL: corner never came down; Attack would be idle\n"); ok = false;
+        }
+
+        struct BandCase { const char* name; double burst, steady; };
+        BandCase bc[] = { { "LF burst / steady HF", 200.0, 8000.0 },
+                          { "HF burst / steady LF", 8000.0, 200.0 } };
+        for (const BandCase& c : bc) {
+            Buffers b(3 * (int)fs);
+            for (int i = 0; i < b.n; ++i) {
+                double t = i / fs, ph = std::fmod(t, 0.5);
+                double env = (ph < 0.10) ? std::exp(-ph * 30.0) : 0.0;
+                float v = (float)(0.18 * env * std::sin(2.0 * M_PI * c.burst * t)
+                                + 0.10 * std::sin(2.0 * M_PI * c.steady * t));
+                b.in[0][i] = b.in[1][i] = v;
+            }
+            process(bx, b);
+            size_t o0 = (size_t)(2.5 * fs), o1 = o0 + (size_t)(0.006 * fs);
+            double gB = 20.0 * std::log10(goertzel(b.out[0], o0, o1, fs, c.burst) /
+                                         (goertzel(b.in[0], o0, o1, fs, c.burst) + 1e-15));
+            double gS = 20.0 * std::log10(goertzel(b.out[0], o0, o1, fs, c.steady) /
+                                         (goertzel(b.in[0], o0, o1, fs, c.steady) + 1e-15));
+            printf("bands: %-22s burst %+5.2f dB  steady %+5.2f dB\n", c.name, gB, gS);
+            if (gB - gS < 1.0) {
+                printf("FAIL: boost not confined to the onset's band\n"); ok = false;
+            }
+            if (!finite8(b)) { printf("FAIL: non-finite output\n"); ok = false; }
+        }
+        bx->dispatcher(bx, effClose, 0, 0, nullptr, 0);
+    }
+
+    // --- lookahead Restore: refused where the host cannot compensate, and in
+    //     a host that can, it delays cleanly and pulls down the quiet window
+    //     ahead of a sharp attack -- where pre-echo lives. ---
+    {
+        if (fx->initialDelay != 0) {
+            printf("FAIL: latency added under a host that reports Equalizer APO\n");
+            ok = false;
+        }
+        AEffect* rx = entry(VSTCALLBACK_daw);
+        rx->dispatcher(rx, effOpen, 0, 0, nullptr, 0);
+        rx->dispatcher(rx, effSetSampleRate, 0, 0, nullptr, (float)fs);
+        rx->dispatcher(rx, effSetBlockSize, 0, 512, nullptr, 0);
+        rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
+        int lat = rx->initialDelay;
+        printf("restore: eapo latency=%d  daw latency=%d (expect ~%d)\n",
+               fx->initialDelay, lat, (int)(0.032 * fs));
+        if (lat < (int)(0.030 * fs) || lat > (int)(0.034 * fs)) {
+            printf("FAIL: lookahead latency not reported correctly\n"); ok = false;
+        }
+
+        // Restore at 0 must be a pure delay: everything else idles on lossless.
+        // Set the knobs BEFORE the mains cycle so the 30 ms parameter smoothers
+        // initialise at zero instead of gliding down from their old values.
+        setParams(rx, 0, 0, 0, 0, 1, 0);
+        rx->setParameter(rx, 5, 0.0f);
+        rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
+        rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
+        Buffers d(1 * (int)fs);
+        for (int i = 0; i < d.n; ++i) {
+            float v = (float)(0.2 * std::sin(2.0 * M_PI * 700.0 * i / fs));
+            d.in[0][i] = d.in[1][i] = v;
+        }
+        process(rx, d);
+        // Skip the first 0.3 s: the 30 ms knob smoothers glide down from their
+        // construction defaults, so the head of the buffer is genuinely filtered.
+        double worst = 0.0;
+        for (int i = (int)(0.3 * fs); i + lat < d.n; ++i)
+            worst = std::max(worst, (double)std::fabs(d.out[0][i + lat] - d.in[0][i]));
+        printf("restore: off -> pure delay, max|out[n+L]-in[n]| = %.3e\n", worst);
+        if (worst > 1e-6) { printf("FAIL: Restore=0 is not a clean delay\n"); ok = false; }
+
+        // A quiet HF bed (standing in for pre-echo) interrupted by loud clicks.
+        // The 20 ms before each click must come down when Restore is up.
+        auto preEchoRms = [&](float depth) {
+            rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
+            rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
+            setParams(rx, 0, 0, 0, 0, 1, 0);
+            rx->setParameter(rx, 5, depth);
+            Buffers b(3 * (int)fs);
+            unsigned rs = 4242u;
+            for (int i = 0; i < b.n; ++i) {
+                rs = rs * 1664525u + 1013904223u;
+                double nz = ((double)(int)(rs >> 1) / 1073741824.0 - 1.0) * 0.004;
+                nz -= 0.5 * nz;                       // crude HF tilt
+                double v = nz;
+                int ph = i % (int)(0.5 * fs);
+                if (ph < 200) v += 0.5 * std::exp(-ph / 40.0);   // click
+                b.in[0][i] = b.in[1][i] = (float)v;
+            }
+            process(rx, b);
+            // window: 20 ms .. 2 ms before the click at t = 2.0 s, delay-shifted
+            size_t c0 = (size_t)(2.0 * fs) + lat;
+            size_t w0 = c0 - (size_t)(0.020 * fs), w1 = c0 - (size_t)(0.002 * fs);
+            double acc = 0.0;
+            for (size_t i = w0; i < w1; ++i) acc += b.out[0][i] * (double)b.out[0][i];
+            return std::sqrt(acc / (double)(w1 - w0));
+        };
+        double rOff = preEchoRms(0.0f), rOn = preEchoRms(1.0f);
+        double cut = 20.0 * std::log10((rOn + 1e-12) / (rOff + 1e-12));
+        printf("restore: pre-click window %.2e -> %.2e  (%+.1f dB)\n", rOff, rOn, cut);
+        if (cut > -3.0) {
+            printf("FAIL: Restore did not attenuate the pre-attack window\n"); ok = false;
+        }
+        // Dormancy WITH the delay line running. The gate measures peak on the
+        // delayed signal and the silence gate deliberately leaves the delay
+        // line alone, so sleeping mid-stream must not swallow or shift audio:
+        // the wake lands exactly one latency after the input returns.
+        //
+        // This needs a genuinely empty delay line to mean anything, which is
+        // what effMainsChanged now guarantees -- it clears the line, so the
+        // tail of the preceding click test cannot drain into the head of this
+        // buffer. (That leak is what left this check unasserted before: it
+        // reported sample 0, and the fault was a stale line surviving the
+        // transport restart, in the plugin rather than the harness.)
+        {
+            setParams(rx, 0, 0, 0, 0, 1, 0);
+            rx->setParameter(rx, 5, 1.0f);          // Restore fully up
+            rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
+            rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
+            Buffers s(2 * (int)fs);                 // 1 s silence, then a tone
+            int t0 = (int)fs;
+            for (int i = t0; i < s.n; ++i) {
+                float v = (float)(0.25 * std::sin(2.0 * M_PI * 900.0 * (i - t0) / fs));
+                s.in[0][i] = s.in[1][i] = v;
+            }
+            process(rx, s);
+            int first = -1;
+            for (int i = 0; i < s.n; ++i)
+                if (std::fabs(s.out[0][i]) > 1e-4f) { first = i; break; }
+            long dm = (long)rx->dispatcher(rx, effVendorSpecific,
+                                           REGEN_DORMANT_QUERY, 0, nullptr, 0);
+            printf("restore: wake-from-sleep sample %d (expect %d = %d+L), dorm=0x%lx\n",
+                   first, t0 + lat, t0, dm);
+            // Slack upward only: the tone starts at a zero crossing, so the
+            // first sample at t0+L is exactly 0 and the threshold is crossed a
+            // sample or two later. Anything EARLIER than t0+L is stale audio.
+            if (first < t0 + lat || first > t0 + lat + 12) {
+                printf("FAIL: wake-from-sleep not one latency after input\n"); ok = false;
+            }
+            if (!finite8(s)) { printf("FAIL: non-finite output\n"); ok = false; }
+        }
+        rx->dispatcher(rx, effClose, 0, 0, nullptr, 0);
     }
 
     fx->dispatcher(fx, effClose, 0, 0, nullptr, 0);

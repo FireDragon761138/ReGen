@@ -19,9 +19,36 @@
 //             midrange envelope so quiet passages don't hiss (Regen knob)
 //   transient zero-lookahead attack boost masks pre-echo smear (Attack knob)
 //
-// A "deficit" factor derived from the corner (0 at ~19.5 kHz, 1 at <=16 kHz)
-// scales the whole chain, so pristine content gets an automatic light touch --
-// no preset system needed.
+// THREE deficit factors derived from the corner scale the chain, so pristine
+// content gets an automatic light touch -- no preset system needed. They are
+// split because the stages repair DIFFERENT defects and are not equally
+// audible at a high corner:
+//
+//   deficit     (cleanup, regen) -- both place their filters RELATIVE to the
+//               corner (corner*1.25 and corner*1.08), so when the corner is
+//               high they act high, above anything anyone can hear. They are
+//               self-limiting and can afford an earlier ramp.
+//               0 at >=17.5 kHz, 1 at <=15 kHz.
+//
+//   audDeficit  (smoother) -- reaches into the AUDIBLE band wherever the corner
+//               sits, working from corner*0.55 (10 kHz at a 18 kHz corner). It
+//               must not engage until the source is audibly damaged.
+//               0 at >=16.5 kHz, 1 at <=14 kHz.
+//
+//   trnGate     (transient) -- not a severity ramp but a LOSSLESS DETECTOR.
+//               Pre-echo is temporal, so the corner cannot rank how badly a
+//               codec smeared transients; it can, however, tell lossless from
+//               lossy, because lossless pins the servo against its ceiling.
+//               Measured as octaves below that ceiling, so it stays correct at
+//               44.1 kHz where the ceiling is 19404 Hz, not 20 kHz.
+//               0 at the ceiling, 1 at kTrnGateOct below it.
+//
+// 16.5 kHz is the audibility anchor: a lowpass above it is inaudible on music.
+// A 320k MP3 therefore idles cleanup, regen and the smoother rather than
+// applying broadband gain to content whose only defect is at 19 kHz.
+//
+// Regen is additionally skipped outright once corner*1.08 reaches the anchor --
+// injecting content nobody can hear is pure cost. See regenAudible.
 //
 // Channel roles (Windows 7.1: 0 FL 1 FR 2 FC 3 LFE 4 BL 5 BR 6 SL 7 SR):
 //   FL/FR  full chain            FC     speech-tuned: no transient shaper,
@@ -29,7 +56,7 @@
 //   BL/BR  cleanup + light regen  LFE   untouched passthrough
 // Detection and dynamics gains are shared per pair so imaging never wanders.
 //
-// Params: 0 Cleanup  1 Smooth  2 Regen  3 Attack  4 Mix  5 Freeze(0/1)
+// Params: 0 Cleanup  1 Smooth  2 Regen  3 Attack  4 Mix  5 Restore  6 Freeze(0/1)
 //
 // Build: see build_mingw.bat.  License: BSD-2-Clause.
 
@@ -38,6 +65,7 @@
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <vector>
 #include <xmmintrin.h>   // MXCSR access for FTZ/DAZ denormal flushing
 
 #if defined(_WIN32)
@@ -49,14 +77,18 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static const VstInt32 kNumParams  = 6;
-static const int      kNumSliders = 5;                 // Freeze is a checkbox
-enum { P_CLEAN = 0, P_SMOOTH, P_REGEN, P_TRANS, P_MIX, P_FREEZE };
+static const VstInt32 kNumParams  = 7;
+static const int      kNumSliders = 6;                 // Freeze is a checkbox
+enum { P_CLEAN = 0, P_SMOOTH, P_REGEN, P_TRANS, P_MIX, P_RESTORE, P_FREEZE };
 
 enum { CH_FL = 0, CH_FR, CH_FC, CH_LFE, CH_BL, CH_BR, CH_SL, CH_SR };
 
 // effVendorSpecific query: index='Roff', value=group 0..3 -> corner in Hz.
 #define REGEN_ROLLOFF_QUERY CCONST('R', 'o', 'f', 'f')
+// index='Dorm' -> bitmask of groups currently asleep (bit g = group g). Sleeping
+// is a pure CPU optimisation with no signal-level signature, so this is the only
+// way a test can assert it actually happens rather than merely not breaking.
+#define REGEN_DORMANT_QUERY CCONST('D', 'o', 'r', 'm')
 
 // Control-rate block: adaptive coefficients and the servo update every
 // kCtrl samples (~1.3 ms at 48 kHz); per-sample cost stays pure filtering.
@@ -160,6 +192,95 @@ static inline double softclip(double x) {
 
 static inline double clamp01(double v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
 
+// Deficit ramps (see the header). Cleanup and regen place their filters
+// relative to the corner and are self-limiting, so they ramp earlier; the
+// smoother and the transient boost act in the audible band regardless of the
+// corner, so they hold off until a lowpass would actually be audible.
+// A lowpass at or above kAudIdleHz is inaudible on music -- that is the anchor.
+// Every stage is scaled by TWO things, and keeping them separate is the whole
+// design:
+//
+//   damage      -- is this source damaged at all? Measured as octaves below the
+//                  servo's ceiling, NOT as an absolute frequency. The ceiling is
+//                  min(20 kHz, 0.44*fs) and so moves with the HOST sample rate:
+//                  20000 Hz at 48k (Equalizer APO always), 19404 at 44.1k,
+//                  9702 at 22.05k. Absolute thresholds would therefore be
+//                  unreachable at low host rates -- offline remastering of a
+//                  22 kHz asset would peg every stage to full strength forever,
+//                  by construction, whatever the audio was. (Content ORIGIN is
+//                  a separate matter: a CD rip resampled to a 48k device keeps
+//                  its 22.05 kHz wall, sails past the cap, and reads lossless.)
+//                  Lossless pins the servo at the ceiling and scores exactly 0;
+//                  every lossy format sits measurably below. A ramp, not a step:
+//                  bandwidth can rank pre-echo and hash audibility (their LEVEL
+//                  falls as bitrate rises) but it cannot resolve adjacent
+//                  bitrates on a knife edge.
+//
+//                  Pleasant side effect: at fs = 22.05k a full-band asset reads
+//                  damage 0, correctly -- regen would inject above corner*1.08
+//                  with Nyquist at 11.025 kHz, so there is no room to synthesize
+//                  into. The same asset through a 48k device resamples up, lands
+//                  at a ~10.4 kHz corner under a 20 kHz ceiling, and gets the
+//                  full treatment. "Bandlimited with headroom to repair" and
+//                  "fills the available band" fall out without being told apart.
+//
+//   audibility  -- does this stage's action land where anyone can hear it?
+//                  Cleanup lowpasses at corner*1.25 and regen injects above
+//                  corner*1.08, so both march upward with the corner and can
+//                  end up working entirely above the hearing limit. Weighted by
+//                  where that action band actually falls. The smoother (from
+//                  corner*0.55) and the transient boost (broadband) always land
+//                  in audible territory, so they carry no such weight.
+//
+// 16.5 kHz is the anchor throughout: a lowpass above it is inaudible on music.
+static const double kAudIdleHz  = 16500.0;   // audibility anchor
+static const double kAudSpanHz  =  3000.0;   // ramp width below the anchor
+static const double kDamageOct  =     0.40;  // octaves below ceiling -> full
+
+// The smoother needs a LATER onset than the rest. It clamps top-octave warble,
+// and warble is a bit-starvation artifact -- coefficients flickering on and off
+// between frames when the encoder runs out of bits. It does not meaningfully
+// exist at high bitrate, so engaging it at a 320k corner costs CPU to chase
+// something that is not there.
+static const double kSmoothOnsetOct = 0.20;  // octaves below ceiling before it starts
+
+// The transient boost has NO corner-derived factor at all. Pre-echo spread is
+// set by the codec's transform block length, not by its bitrate or its lowpass:
+// an MP3 short block smears over 1152/384 samples (26.1 / 8.7 ms at 44.1 kHz),
+// Vorbis over 2048/256 (46.4 / 5.8 ms), and those lengths do not change when
+// you raise the bitrate. Backward masking only covers a few ms -- premasking is
+// usually put at 0.5-2 ms, effective under 5 ms, against 10-50 ms forward -- so
+// even a correctly switched MP3 short block stays partly exposed. Which is why
+// transients fail at 192k and 320k alike, and why no setting of a bandwidth
+// ramp can gate this stage correctly. It idles on its own: the onset term goes
+// to zero on steady material, exactly as the Crystalizer did.
+static const double kTrnSplitHz = 2000.0;   // transient LF/HF crossover
+
+// ...but it must still idle on lossless. The corner cannot rank HOW badly a
+// codec smeared transients -- 192k and 320k are not separable that way -- yet
+// it answers a much easier question reliably: is this lossless at all? Lossless
+// pins the servo hard against its ceiling (measured: exactly cornerMax for both
+// 48 kHz native and CD-sourced material), while every lossy format sits
+// measurably below it, the nearest being high-quality Ogg at ~0.065 octaves
+// down. So the gate is expressed as distance BELOW THE CEILING, not as an
+// absolute frequency -- which also keeps it correct at 44.1 kHz, where the
+// ceiling is 0.44*fs = 19404 Hz rather than 20 kHz.
+//
+// It is a gentle ramp, not a step, and the reason is worth stating precisely.
+// Block length fixes the DURATION of the smear and does not change with
+// bitrate. But audibility is the smear's LEVEL against the masking threshold,
+// and level does fall as bitrate rises -- which bandwidth tracks. So the corner
+// can legitimately rank pre-echo audibility even though it cannot rank pre-echo
+// duration. What it cannot do is resolve adjacent bitrates on a knife edge,
+// hence a ramp spanning ~0.4 octaves rather than a cliff. Calibration target:
+// 320k MP3 lands near half a dB (a near-transparent format should get a
+// near-inaudible correction), 192k clearly engaged, 128k and below full.
+static const double kTrnGateOct = 0.40;     // octaves below ceiling -> full
+
+// Idle gate, shared by the plugin-wide gate and the per-group ones.
+static const double kGateThresh = 1e-5;     // ~-100 dBFS peak
+static const double kGateHold   = 0.25;     // seconds below thresh to sleep
+
 // Clamped Pade tanh: within ~1e-3 of tanh for |x|<3, hard 1 beyond. Plenty
 // for waveshaping and much cheaper than libm's tanh at 7 calls per sample.
 static inline double fastTanh(double x) {
@@ -193,7 +314,20 @@ struct Group {
     double hRef = 0, hLo = 0, hHi = 0;    // gated peak-hold versions
     double wideMS = 0;                    // wideband gate meter
     double cornerLog = 0, appliedLog = -1;
-    double deficit = 0;                   // 0 = pristine, 1 = badly bandlimited
+    double damage  = 0;                   // 0 = pristine (servo pinned), 1 = wrecked
+    double dSmooth = 0;                   // damage, but starting later (warble)
+    double wClean  = 0;                   // audibility of cleanup's action band
+    double wRegen  = 0;                   // audibility of regen's injection band
+
+    // --- per-group idle gate ---
+    // The plugin-wide gate keys off the peak across all EIGHT channels, so one
+    // active channel kept every group running: measured, 6 digitally silent
+    // channels cost exactly as much as 6 active ones. In Equalizer APO ReGen
+    // sits ahead of any upmixer, so stereo content leaves 3 of 4 groups
+    // processing nothing at all. Each group now sleeps on its own pair.
+    int    silentRun = 0;
+    bool   dormant   = false;
+    int    hang      = 0;                  // samples of sub-threshold before sleep
 
     // --- adaptive processing ---
     Biquad    cleanLP[2];
@@ -204,7 +338,19 @@ struct Group {
     EnvAR     midEnv;                     // shared level link
     OnePoleLP dkLo1, dkLo2, dkHi1, dkHi2; // sibilance bands (center only)
     EnvAR     envSib, envVoice;
-    EnvAR     trFast, trSlow;             // transient detector (fronts only)
+
+    // --- transient restoration (fronts only), Crystalizer-shaped ---
+    // TWO bands with independent detectors and independent gains. Pre-echo is
+    // high-frequency dominant (that is where the codec allocates fewest bits),
+    // and a single broadband gain "repairing" it was measured putting +0.59 dB
+    // onto a 200 Hz burst. The X-Fi Crystalizer this stage descends from ran
+    // separate low- and high-frequency energy flux with proportionally weighted
+    // per-band boosts, for exactly this reason. Complementary 1st-order split
+    // (hf = x - lp) so the bands recombine to unity when the gains are equal.
+    OnePoleLP trSplitD;                   // detection split (on the pair's sum)
+    OnePoleLP trSplitA[2];                // application split (per channel)
+    EnvAR     trFastLo, trSlowLo;
+    EnvAR     trFastHi, trSlowHi;
 
     void configure(double fs, double cornerMaxLog) {
         refBP.setBP(fs, 2000.0, 0.8);
@@ -217,7 +363,13 @@ struct Group {
         hbFast.init(fs, 1.0, 15.0);   hbSlow.init(fs, 40.0, 80.0);
         midEnv.init(fs, 4.0, 50.0);
         envSib.init(fs, 3.0, 50.0);   envVoice.init(fs, 3.0, 50.0);
-        trFast.init(fs, 0.5, 40.0);   trSlow.init(fs, 15.0, 140.0);
+        trFastLo.init(fs, 0.5, 40.0); trSlowLo.init(fs, 15.0, 140.0);
+        trFastHi.init(fs, 0.5, 40.0); trSlowHi.init(fs, 15.0, 140.0);
+        trSplitD.setCutoff(fs, kTrnSplitHz);
+        trSplitA[0].setCutoff(fs, kTrnSplitHz);
+        trSplitA[1].setCutoff(fs, kTrnSplitHz);
+        hang = (int)(kGateHold * fs);
+        silentRun = 0; dormant = false;
         cornerLog = cornerMaxLog;
         appliedLog = -1.0;            // force coefficient apply on next ctrl
     }
@@ -232,7 +384,8 @@ struct Group {
         }
         hbFast.reset(); hbSlow.reset(); midEnv.reset();
         envSib.reset(); envVoice.reset();
-        trFast.reset(); trSlow.reset();
+        trFastLo.reset(); trSlowLo.reset(); trFastHi.reset(); trSlowHi.reset();
+        trSplitD.reset(); trSplitA[0].reset(); trSplitA[1].reset();
         dkLo1.reset(); dkLo2.reset(); dkHi1.reset(); dkHi2.reset();
     }
 
@@ -256,7 +409,19 @@ struct Group {
         }
 
         double corner = std::exp2(cornerLog);
-        deficit = clamp01((19500.0 - corner) / 3500.0);
+
+        // How damaged: distance below the ceiling, in octaves.
+        double below = cornerMaxLog - cornerLog;
+        damage  = clamp01(below / kDamageOct);
+        dSmooth = clamp01((below - kSmoothOnsetOct) / (kDamageOct - kSmoothOnsetOct));
+
+        // Where each stage lands. Above the anchor there is nothing to gain --
+        // equal-loudness contours roll off steeply up there, more steeply still
+        // at low level, and regen's injection is level-linked -- so work done
+        // there is inaudible however much of it we do. Ramps rather than hard
+        // switches so two similar sources cannot fall either side of a cliff.
+        wClean = clamp01((kAudIdleHz - corner * 1.25) / kAudSpanHz);
+        wRegen = clamp01((kAudIdleHz - corner * 1.08) / kAudSpanHz);
 
         if (std::fabs(cornerLog - appliedLog) > 5e-4) {
             appliedLog = cornerLog;
@@ -278,6 +443,25 @@ struct Group {
     inline void tick(double* x, const double* dry, double kMS100, double kMS200,
                      double cln, double smo, double reg, double trn) {
         int a = chA, b = chB;
+
+        // -- per-group idle gate --
+        // Leaves x[] untouched, so the group's channels pass through dry. The
+        // wake test runs before the skip, so the first audible sample after
+        // silence is processed normally. resetSignalState() zeroes the meters,
+        // which closes ctrl()'s gate and parks the learned corner.
+        {
+            double pk = std::fabs(dry[a]);
+            if (b >= 0) { double t = std::fabs(dry[b]); if (t > pk) pk = t; }
+            if (dormant) {
+                if (pk < kGateThresh) return;
+                dormant = false; silentRun = 0;
+            } else if (pk < kGateThresh) {
+                if (++silentRun >= hang) {
+                    resetSignalState(); dormant = true; silentRun = 0; return;
+                }
+            } else silentRun = 0;
+        }
+
         double xa = x[a], xb = (b >= 0) ? x[b] : 0.0;
 
         // -- detection taps (meters free-run; gating happens in ctrl()) --
@@ -288,15 +472,22 @@ struct Group {
         double hi = probeHi.process(m); msHi  += kMS200 * (hi * hi - msHi);
 
         // -- cleanup: bury swirl/hash just above the corner --
-        double cEff = cln * deficit;
-        double lpA = cleanLP[0].process(xa); xa += cEff * (lpA - xa);
-        if (b >= 0) { double lpB = cleanLP[1].process(xb); xb += cEff * (lpB - xb); }
+        // Gated like the stages below rather than run-and-multiply-by-zero: at
+        // cEff = 1e-3 the wet mix is a tenth of a percent of a gentle lowpass,
+        // orders of magnitude under the ~0.5-1 dB level JND. Filter state goes
+        // stale while skipped, but cEff ramps up from zero on re-engage so it
+        // is faded in, never switched in.
+        double cEff = cln * damage * wClean;
+        if (cEff > 1e-3) {
+            double lpA = cleanLP[0].process(xa); xa += cEff * (lpA - xa);
+            if (b >= 0) { double lpB = cleanLP[1].process(xb); xb += cEff * (lpB - xb); }
+        }
 
         // -- top-octave flutter smoother (attenuate-only, shared gain) --
         // Skipped when its gain is zero (pristine content / knob down); the
         // gain ramps continuously through zero, so re-engaging never clicks
         // even though the envelopes restart cold.
-        if (useSmooth && smo * deficit > 1e-5) {
+        if (useSmooth && smo * dSmooth > 1e-3) {
             double hbA = xa - smLP[0].process(xa);
             double hbB = (b >= 0) ? xb - smLP[1].process(xb) : 0.0;
             double he  = (b >= 0) ? 0.5 * (std::fabs(hbA) + std::fabs(hbB))
@@ -305,7 +496,7 @@ struct Group {
             double g = (es + 1e-7) / (ef + 1e-7);
             if (g > 1.0)  g = 1.0;
             if (g < 0.35) g = 0.35;
-            double ge = 1.0 + smo * deficit * (g - 1.0);
+            double ge = 1.0 + smo * dSmooth * (g - 1.0);
             xa += (ge - 1.0) * hbA;
             if (b >= 0) xb += (ge - 1.0) * hbB;
         }
@@ -313,8 +504,8 @@ struct Group {
         // -- regeneration: harmonics from 3-8 kHz, injected above the corner --
         // Also gain-gated like the smoother: envelopes restart cold on
         // re-engage but the add ramps up from zero, so no click.
-        double gEx = reg * exScale * deficit * 1.2;
-        if (gEx > 1e-5) {
+        double gEx = reg * exScale * damage * wRegen * 1.2;
+        if (gEx > 1e-3) {
             double bpA = ex8[0].process(xa - ex3[0].process(xa));
             double bpB = (b >= 0) ? ex8[1].process(xb - ex3[1].process(xb)) : 0.0;
             double ae  = (b >= 0) ? 0.5 * (std::fabs(bpA) + std::fabs(bpB))
@@ -334,22 +525,163 @@ struct Group {
                 xb += injHP[1][1].process(injHP[1][0].process(shapeHF(bpB * nrm))) * me * gEx;
         }
 
-        // -- transient attack boost (masks pre-echo smear) --
-        if (useTrans) {
-            double d = (b >= 0) ? 0.5 * (std::fabs(dry[a]) + std::fabs(dry[b]))
-                                : std::fabs(dry[a]);
-            double ef = trFast.next(d), es = trSlow.next(d);
-            double onset = (ef - es) / (es + 1e-5);
-            if (onset < 0.0) onset = 0.0;
-            if (onset > 1.6) onset = 1.6;
-            double tg = 1.0 + trn * deficit * 0.8 * onset;
-            if (tg > 2.0) tg = 2.0;
-            xa *= tg;
-            if (b >= 0) xb *= tg;
+        // -- transient restoration: per-band onset boost --
+        // Detection runs on the pair's SIGNED sum split into two bands (the
+        // split has to happen before rectification or the band information is
+        // gone). Dividing by the slow envelope makes onset large when an attack
+        // arrives out of a quiet passage -- which is precisely the condition
+        // that produces pre-echo ("a sharp attack beginning near the end of a
+        // transform block immediately following a region of low energy") and
+        // also where backward masking has least to work with.
+        if (useTrans && trn * damage > 1e-3) {
+            double dm  = (b >= 0) ? 0.5 * (dry[a] + dry[b]) : dry[a];
+            double dLo = trSplitD.process(dm);
+            double dHi = dm - dLo;
+            double efL = trFastLo.next(std::fabs(dLo));
+            double esL = trSlowLo.next(std::fabs(dLo));
+            double efH = trFastHi.next(std::fabs(dHi));
+            double esH = trSlowHi.next(std::fabs(dHi));
+
+            double onL = (efL - esL) / (esL + 1e-5);
+            double onH = (efH - esH) / (esH + 1e-5);
+            if (onL < 0.0) onL = 0.0;  if (onL > 1.6) onL = 1.6;
+            if (onH < 0.0) onH = 0.0;  if (onH > 1.6) onH = 1.6;
+
+            double tEff = trn * damage;
+            double gLo = 1.0 + tEff * 0.8 * onL;  if (gLo > 2.0) gLo = 2.0;
+            double gHi = 1.0 + tEff * 0.8 * onH;  if (gHi > 2.0) gHi = 2.0;
+
+            // The application split runs unconditionally so its state stays
+            // warm (two one-poles, and only the front group sets useTrans), but
+            // the recombine is skipped when neither band is lifting: steady
+            // material then stays bit-exact, since lo + (x - lo) is not
+            // guaranteed to round-trip exactly in floating point.
+            double aLo = trSplitA[0].process(xa);
+            double bLo = (b >= 0) ? trSplitA[1].process(xb) : 0.0;
+            if (gLo > 1.0 || gHi > 1.0) {
+                xa = aLo * gLo + (xa - aLo) * gHi;
+                if (b >= 0) xb = bLo * gLo + (xb - bLo) * gHi;
+            }
         }
 
         x[a] = xa;
         if (b >= 0) x[b] = xb;
+    }
+};
+
+// ------------------------------------------------------ lookahead restore ----
+// Everything else in this plugin MASKS pre-echo -- it lifts the transient so
+// backward masking covers more of the smear. That is all a zero-latency process
+// can do, and it is not much: backward masking runs 0.5-2 ms (under 5 ms
+// effective) against an MP3 short block's 8.7 ms of spread.
+//
+// With lookahead the problem inverts. Pre-echo occupies the window BEFORE an
+// attack; given enough delay we detect the attack while that window is still
+// sitting in the delay line, unemitted, and can attenuate it instead of trying
+// to hide it. That is removal of added noise -- correction of the decoded
+// signal's temporal envelope -- not psychoacoustic sleight of hand.
+//
+// What it cannot do is restore detail the quantiser discarded inside the
+// transient. It reconstructs the ENVELOPE, not the CONTENT. The envelope is
+// what reads as smear, so that is the part worth having.
+//
+// The false-positive guard comes straight out of the literature: pre-echo needs
+// "a sharp attack beginning near the end of a transform block immediately
+// following a region of low energy". Requiring the pre-window to sit well below
+// the attack keeps this off snare rolls, crescendos and reverb tails, where a
+// naive version would punch audible holes.
+//
+// OFF by default and refused outright under Equalizer APO, which does no plugin
+// delay compensation -- 32 ms of uncompensated latency would wreck A/V sync.
+static const double kRestoreLookMs  = 32.0;    // > MP3 long block (26.1 ms @44.1k)
+static const double kRestoreWinMs   = 26.0;    // suppression window
+static const double kRestoreRampMs  =  2.0;    // edge ramps, no step at the attack
+static const double kRestoreSplitHz = 3000.0;  // pre-echo is high-frequency
+static const double kRestoreRatio   =  6.0;    // attack : pre-window, ~15.6 dB
+static const double kRestoreMaxDb   = 14.0;    // deepest cut at Restore = 1
+
+struct RestoreStage {
+    std::vector<float> dl[8];             // every channel: latency must be uniform
+    std::vector<float> gring;             // scheduled HF gain, 1 = untouched
+    int len = 0, L = 0, W = 0, ramp = 1, wpos = 0, hold = 0, holdLen = 0;
+    OnePoleLP splitD, splitA[2];          // hf = x - lp
+    EnvAR envFast, envSlow;
+    bool ready = false;
+
+    int configure(double fs) {
+        L = (int)(kRestoreLookMs * 0.001 * fs);
+        W = (int)(kRestoreWinMs  * 0.001 * fs);
+        ramp = (int)(kRestoreRampMs * 0.001 * fs); if (ramp < 1) ramp = 1;
+        if (W > L - 8) W = L - 8;
+        if (W < 2 * ramp + 2) { ready = false; return 0; }
+        len = L + 8;
+        for (int c = 0; c < 8; ++c) dl[c].assign(len, 0.0f);
+        gring.assign(len, 1.0f);
+        splitD.setCutoff(fs, kRestoreSplitHz);
+        splitA[0].setCutoff(fs, kRestoreSplitHz);
+        splitA[1].setCutoff(fs, kRestoreSplitHz);
+        envFast.init(fs, 0.3, 20.0);
+        envSlow.init(fs, 25.0, 250.0);
+        holdLen = (int)(0.005 * fs);
+        wpos = 0; hold = 0; ready = true;
+        return L;
+    }
+
+    void reset() {
+        for (int c = 0; c < 8; ++c) std::fill(dl[c].begin(), dl[c].end(), 0.0f);
+        std::fill(gring.begin(), gring.end(), 1.0f);
+        splitD.reset(); splitA[0].reset(); splitA[1].reset();
+        envFast.reset(); envSlow.reset();
+        wpos = 0; hold = 0;
+    }
+
+    // Paint the attenuation profile back over the window preceding the attack.
+    // W < L guarantees none of it has been emitted yet. min() so overlapping
+    // hits deepen rather than overwrite each other.
+    void schedule(double gain) {
+        for (int k = 1; k <= W; ++k) {
+            int idx = wpos - k; while (idx < 0) idx += len;
+            double f;
+            if (k <= ramp)            f = 1.0 - (1.0 - gain) * (double)k / ramp;
+            else if (k > W - ramp)    f = 1.0 - (1.0 - gain) * (double)(W - k) / ramp;
+            else                      f = gain;
+            if (f < gring[idx]) gring[idx] = (float)f;
+        }
+    }
+
+    // Replaces x[]/dry[] with the delayed signal, pre-echo suppressed on the
+    // fronts. dry[] carries the delayed-but-untouched reference so Mix still
+    // means what it says.
+    void tick(double* x, double* dry, double depth) {
+        double dm = 0.5 * (dry[CH_FL] + dry[CH_FR]);
+        double hf = dm - splitD.process(dm);
+        double a  = std::fabs(hf);
+        double ef = envFast.next(a), es = envSlow.next(a);
+
+        if (hold > 0) --hold;
+        else if (es > 1e-7 && ef > es * kRestoreRatio) {
+            // Sharper attack out of a quieter window -> deeper cut, capped.
+            double excess = ef / (es * kRestoreRatio) - 1.0;
+            double d = depth * clamp01(excess);
+            double gain = std::pow(10.0, -kRestoreMaxDb * d / 20.0);
+            schedule(gain);
+            hold = holdLen;
+        }
+
+        for (int c = 0; c < 8; ++c) dl[c][wpos] = (float)dry[c];
+
+        int r = wpos - L; if (r < 0) r += len;
+        double g = gring[r];
+        gring[r] = 1.0f;                       // consume
+        for (int c = 0; c < 8; ++c) dry[c] = x[c] = dl[c][r];
+        if (g < 1.0f) {
+            for (int i = 0; i < 2; ++i) {
+                int c = (i == 0) ? CH_FL : CH_FR;
+                double lo = splitA[i].process(x[c]);
+                x[c] = lo + (x[c] - lo) * g;   // high band only
+            }
+        }
+        if (++wpos >= len) wpos = 0;
     }
 };
 
@@ -365,15 +697,20 @@ struct ReGen {
     double fs = 44100.0;
 
     Group groups[kNumGroups];
+    RestoreStage restore;
+    // Latency is FIXED whenever the host can compensate, rather than following
+    // the knob: a lookahead that appears and disappears mid-session makes the
+    // host re-negotiate delay compensation and jumps the stream. The knob sets
+    // depth only. Refused entirely under a host that identifies as Equalizer
+    // APO, which does no PDC at all.
+    bool restoreAllowed = false;
     int   ctrlCount = 0;
 
-    // Idle gate: after kGateHold of sub-threshold input, signal state is
-    // flushed and processing is skipped until the first loud sample (which is
-    // always processed -- the wake test runs BEFORE the skip, so onsets after
-    // silence are never touched). Transparent in EAPO, big save on silent
-    // DAW tracks. The learned corners survive dormancy.
-    static constexpr double kGateThresh = 1e-5;   // ~-100 dBFS peak
-    static constexpr double kGateHold   = 0.25;   // seconds below thresh to sleep
+    // Plugin-wide idle gate: after kGateHold of sub-threshold input on EVERY
+    // channel, signal state is flushed and processing is skipped until the
+    // first loud sample (which is always processed -- the wake test runs BEFORE
+    // the skip, so onsets after silence are never touched). Groups additionally
+    // sleep individually; see Group::dormant.
     int  silentRun = 0;
     bool dormant   = false;
 
@@ -382,7 +719,7 @@ struct ReGen {
     double stepUp = 0, stepDown = 0, holdAtt = 0, holdRel = 0;
     double cornerMinLog = 0, cornerMaxLog = 0;
 
-    Smooth smClean, smSmooth, smRegen, smTrans, smMix;
+    Smooth smClean, smSmooth, smRegen, smTrans, smMix, smRestore;
 
 #if defined(_WIN32)
     HWND edContainer = nullptr;
@@ -412,8 +749,14 @@ struct ReGen {
         params[P_CLEAN]  = 0.7f;
         params[P_SMOOTH] = 0.5f;
         params[P_REGEN]  = 0.6f;
-        params[P_TRANS]  = 0.5f;
+        // 0.35, not the 0.5 that ReGen-retro-defaults.md offers as its
+        // alternative: that branch was conditioned on Attack self-disabling on
+        // content that does not need it. Removing the corner dependence gives
+        // exactly that up -- the stage is now always available and idles only
+        // on steady material -- so the conservative branch is the right one.
+        params[P_TRANS]  = 0.35f;
         params[P_MIX]    = 1.0f;
+        params[P_RESTORE] = 0.0f;         // off: costs latency, needs host PDC
         params[P_FREEZE] = 0.0f;
     }
 
@@ -445,26 +788,47 @@ struct ReGen {
         smRegen.init(fs, 30.0, params[P_REGEN]);
         smTrans.init(fs, 30.0, params[P_TRANS]);
         smMix.init(fs, 30.0, params[P_MIX]);
+        smRestore.init(fs, 30.0, params[P_RESTORE]);
+        int lat = restoreAllowed ? restore.configure(fs) : 0;
+        if (effect.initialDelay != lat) {
+            effect.initialDelay = lat;
+            if (master) master(&effect, audioMasterIOChanged, 0, 0, nullptr, 0.0f);
+        }
         ctrlCount = 0;
     }
 
-    void resetState() {
+    void resetState() {   // signal state only: also called by the silence gate
         for (int g = 0; g < kNumGroups; ++g) groups[g].resetSignalState();
         ctrlCount = 0;
         silentRun = 0;
         dormant   = false;
-        // Auto-clear Freeze when the host restarts the pipeline (effMainsChanged).
-        // EAPO loads one instance system-wide, so a corner frozen for an old game
-        // would otherwise persist and lowpass whatever runs next. The GUI checkbox
-        // resyncs on its timer via syncFromHost().
+    }
+
+    // Pipeline restart (effMainsChanged on). Two extras beyond the signal-state
+    // flush, and both would be WRONG in resetState() itself, because the
+    // silence gate calls that mid-stream:
+    //   - Freeze auto-clears. EAPO loads one instance system-wide, so a corner
+    //     frozen for an old game would otherwise persist and lowpass whatever
+    //     runs next -- but a paused game going digitally silent must not
+    //     uncheck the user's Freeze, hence not in resetState(). The GUI
+    //     checkbox resyncs on its timer via syncFromHost().
+    //   - The Restore delay line empties. Across a transport stop/start, up to
+    //     32 ms of stale pre-stop audio would otherwise replay on resume. The
+    //     silence gate must NOT do this: it sleeps mid-stream, where the line
+    //     has to keep turning or the stream would jump on wake.
+    void mainsRestart() {
+        resetState();
+        restore.reset();
         params[P_FREEZE] = 0.0f;
     }
 
     void ctrlUpdate() {
         bool frozen = params[P_FREEZE] > 0.5f;
-        for (int g = 0; g < kNumGroups; ++g)
+        for (int g = 0; g < kNumGroups; ++g) {
+            if (groups[g].dormant) continue;   // meters are zeroed; corner parked
             groups[g].ctrl(fs, frozen, stepUp, stepDown, holdAtt, holdRel,
                            cornerMinLog, cornerMaxLog);
+        }
     }
 
     double cornerHz(int g) const {
@@ -481,8 +845,18 @@ struct ReGen {
         const int hang = (int)(kGateHold * fs);
         for (VstInt32 i = 0; i < n; ++i) {
             double x[8], dry[8], peak = 0.0;
-            for (int c = 0; c < 8; ++c) {
+            for (int c = 0; c < 8; ++c)
                 dry[c] = x[c] = in[c] ? (double)in[c][i] : 0.0;
+
+            // -- lookahead pre-echo suppression --
+            // Runs FIRST and before the idle gate, because it rewrites x[] and
+            // dry[] with the delayed signal: everything downstream, including
+            // the gate's peak test and the groups' dry[] reference, has to see
+            // the same time base. The delay line must keep turning even while
+            // the plugin idles or the stream would jump on wake.
+            if (restore.ready) restore.tick(x, dry, smRestore.next(params[P_RESTORE]));
+
+            for (int c = 0; c < 8; ++c) {
                 double a = std::fabs(dry[c]);
                 if (a > peak) peak = a;
             }
@@ -534,7 +908,7 @@ struct ReGen {
 
 // ------------------------------------------------------------- editor GUI ----
 #if defined(_WIN32)
-static VstRect g_edRect = { 0, 0, 330, 460 };
+static VstRect g_edRect = { 0, 0, 378, 460 };
 
 enum { kResetId = 200, kFreezeId = 201, kStatusTimer = 1 };
 
@@ -610,6 +984,8 @@ void ReGen::openEditor(HWND parent) {
 
     static const char* kClass = "ReGenEditorWnd";
     WNDCLASSEXA wc;
+    ZeroMemory(&wc, sizeof wc);
+    wc.cbSize = sizeof wc;               // GetClassInfoExA requires this preset
     if (!GetClassInfoExA(inst, kClass, &wc)) {
         ZeroMemory(&wc, sizeof wc);
         wc.cbSize        = sizeof wc;
@@ -634,7 +1010,7 @@ void ReGen::openEditor(HWND parent) {
                     374, 6, 74, 22, edContainer,
                     (HMENU)(intptr_t)kResetId, inst, nullptr);
 
-    const char* names[kNumSliders] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix" };
+    const char* names[kNumSliders] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix", "Restore" };
     for (int i = 0; i < kNumSliders; ++i) {
         int y = 40 + i * 48;
         CreateWindowExA(0, "STATIC", names[i], WS_CHILD | WS_VISIBLE,
@@ -760,7 +1136,7 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
 
     case effSetSampleRate: p->setSampleRate((double)opt); return 0;
     case effSetBlockSize:  return 0;
-    case effMainsChanged:  if (value) p->resetState(); return 0;
+    case effMainsChanged:  if (value) p->mainsRestart(); return 0;
 
 #if defined(_WIN32)
     // Equalizer APO calls effEditGetRect and dereferences the returned pointer
@@ -785,14 +1161,17 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
         if (index < 0 || index >= kNumParams) { copyStr(ptr, "", kMaxParamStr); return 0; }
         if (opcode == effGetParamName) {
             // Must fit kVstMaxParamStrLen (8 bytes -> 7 chars).
-            const char* names[] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix", "Freeze" };
+            const char* names[] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix",
+                                    "Restore", "Freeze" };
             copyStr(ptr, names[index], kMaxParamStr);
         } else if (opcode == effGetParamLabel) {
-            const char* labels[] = { "%", "%", "%", "%", "%", "" };
+            const char* labels[] = { "%", "%", "%", "%", "%", "%", "" };
             copyStr(ptr, labels[index], kMaxParamStr);
         } else { // display
             if (index == P_FREEZE) {
                 copyStr(ptr, p->params[P_FREEZE] > 0.5f ? "On" : "Off", kMaxParamStr);
+            } else if (index == P_RESTORE && !p->restoreAllowed) {
+                copyStr(ptr, "n/a", kMaxParamStr);   // no PDC in this host
             } else {
                 std::snprintf(buf, sizeof buf, "%.0f", p->params[index] * 100.0);
                 copyStr(ptr, buf, kMaxParamStr);
@@ -808,6 +1187,11 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
     case effVendorSpecific:
         if (index == REGEN_ROLLOFF_QUERY && p)
             return (VstIntPtr)std::lround(p->cornerHz((int)value));
+        if (index == REGEN_DORMANT_QUERY && p) {
+            VstIntPtr m = 0;
+            for (int g = 0; g < kNumGroups; ++g) if (p->groups[g].dormant) m |= (1 << g);
+            return m;
+        }
         return 0;
 
     case effGetEffectName:    copyStr(ptr, "ReGen", kMaxEffectName); return 1;
@@ -865,6 +1249,21 @@ VST_EXPORT AEffect* VSTPluginMain(audioMasterCallback audioMaster) {
     e->object      = p;
 
     p->master = audioMaster;
+
+    // Restore needs the host to compensate 32 ms of latency. Equalizer APO does
+    // not, so it is refused there outright. The test is deliberately asymmetric:
+    // refuse only on a POSITIVE identification, because an unidentified host
+    // (a minimal offline harness, say) is one the user drove deliberately, and
+    // Restore still defaults to off there.
+    if (audioMaster) {
+        char host[80] = {0};
+        audioMaster(e, audioMasterGetProductString, 0, 0, host, 0.0f);
+        host[sizeof(host) - 1] = 0;
+        bool isEapo = false;
+        for (char* s = host; *s; ++s)                       // case-insensitive find
+            if ((s[0] | 32) == 'e' && _strnicmp(s, "equalizer", 9) == 0) isEapo = true;
+        p->restoreAllowed = !isEapo;
+    }
     return e;
 }
 
