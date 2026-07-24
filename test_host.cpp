@@ -74,17 +74,12 @@ static void process(AEffect* fx, Buffers& b) {
     }
 }
 
-// Param order: 0 Cleanup 1 Smooth 2 Regen 3 Air 4 Attack 5 Mix 6 Restore 7 Freeze.
-// Air defaults to 0 so existing cases keep isolating the stage under test.
 static void setParams(AEffect* fx, float clean, float smooth, float regen,
-                      float trans, float mix, float freeze, float air = 0.0f) {
+                      float trans, float mix, float freeze) {
     fx->setParameter(fx, 0, clean);  fx->setParameter(fx, 1, smooth);
-    fx->setParameter(fx, 2, regen);  fx->setParameter(fx, 3, air);
-    fx->setParameter(fx, 4, trans);  fx->setParameter(fx, 5, mix);
-    fx->setParameter(fx, 7, freeze);
+    fx->setParameter(fx, 2, regen);  fx->setParameter(fx, 3, trans);
+    fx->setParameter(fx, 4, mix);    fx->setParameter(fx, 6, freeze);
 }
-static const int kP_RESTORE = 6;
-static const int kP_FREEZE  = 7;
 
 static long corner(AEffect* fx, int group) {
     return (long)fx->dispatcher(fx, effVendorSpecific, REGEN_ROLLOFF_QUERY,
@@ -301,78 +296,6 @@ int main() {
         if (!finite8(b)) { printf("FAIL: non-finite output\n"); ok = false; }
     }
 
-    // --- lossless is untouched with EVERY knob at maximum ---
-    // The headline safety property, and the one the restoration and air stages
-    // could most easily break: both ADD energy, so if either leaks past its
-    // damage gate it shows up here. Full-band content pins the servo at its
-    // ceiling, damage reads exactly 0, and every stage must therefore
-    // contribute exactly nothing -- not "almost nothing". Peak is kept at 0.44
-    // so the soft-clip knee at 0.8 cannot be mistaken for a leak.
-    {
-        AEffect* lx = freshFx(entry);
-        Buffers b(8 * (int)fs);
-        const double fAll[] = { 500, 1200, 2400, 3000, 4500, 6000, 8000,
-                                10000, 12500, 16000, 19000 };
-        for (int i = 0; i < b.n; ++i) {
-            double t = i / fs, v = 0.0;
-            for (double f : fAll) v += 0.04 * std::sin(2.0 * M_PI * f * t);
-            b.in[0][i] = b.in[1][i] = (float)v;
-        }
-        setParams(lx, 1, 1, 1, 1, 1, 0, 1);        // everything, Air included
-        process(lx, b);
-        double worst = 0.0, pk = 0.0;
-        for (int i = b.n / 2; i < b.n; ++i) {      // second half: servo settled
-            worst = std::max(worst, (double)std::fabs(b.out[0][i] - b.in[0][i]));
-            pk    = std::max(pk, (double)std::fabs(b.in[0][i]));
-        }
-        long c = corner(lx, 0);
-        printf("clean: lossless corner=%ld peak=%.3f  max|out-in|=%.3e\n",
-               c, pk, worst);
-        if (c < 19000) { printf("FAIL: servo did not pin on full-band content\n"); ok = false; }
-        if (worst != 0.0) {
-            printf("FAIL: lossless not bit-exact with all knobs up\n"); ok = false;
-        }
-        if (!finite8(b)) { printf("FAIL: non-finite output\n"); ok = false; }
-        lx->dispatcher(lx, effClose, 0, 0, nullptr, 0);
-    }
-
-    // --- air: tilt the SURVIVING band, and only when the wall is real ---
-    {
-        AEffect* ax = freshFx(entry);
-        Buffers tr(8 * (int)fs);
-        fillSignal(tr, true);                       // train the corner down
-        setParams(ax, 0, 0, 0, 0, 1, 0, 0);
-        process(ax, tr);
-        long c = corner(ax, 0);
-
-        Buffers b(3 * (int)fs);
-        fillSignal(b, true);
-        setParams(ax, 0, 0, 0, 0, 1, 1, 0);         // frozen, air off
-        process(ax, b);
-        double off6 = goertzel(b.out[0], b.n / 2, b.n, fs, 8000.0);
-        double off1 = goertzel(b.out[0], b.n / 2, b.n, fs, 1200.0);
-        setParams(ax, 0, 0, 0, 0, 1, 1, 1);         // air full
-        process(ax, b);
-        double on6 = goertzel(b.out[0], b.n / 2, b.n, fs, 8000.0);
-        double on1 = goertzel(b.out[0], b.n / 2, b.n, fs, 1200.0);
-        double dHi = 20.0 * std::log10((on6 + 1e-15) / (off6 + 1e-15));
-        double dLo = 20.0 * std::log10((on1 + 1e-15) / (off1 + 1e-15));
-        long prs = (long)ax->dispatcher(ax, effVendorSpecific,
-                                        CCONST('P','r','s','s'), 0, nullptr, 0);
-        long slp = (long)ax->dispatcher(ax, effVendorSpecific,
-                                        CCONST('S','l','o','p'), 0, nullptr, 0);
-        long tnl = (long)ax->dispatcher(ax, effVendorSpecific,
-                                        CCONST('T','o','n','l'), 0, nullptr, 0);
-        printf("air  : corner=%ld  8k %+.2f dB  1.2k %+.2f dB   "
-               "pressure=%.2f slope=%.2f tonal=%.2f\n",
-               c, dHi, dLo, prs / 1000.0, slp / 1000.0, tnl / 1000.0);
-        if (dHi < 2.0)        { printf("FAIL: air did not lift the top band\n"); ok = false; }
-        if (dLo > 0.5)        { printf("FAIL: air leaked into the midrange\n"); ok = false; }
-        if (dHi - dLo < 2.0)  { printf("FAIL: air is level, not tilt\n"); ok = false; }
-        if (!finite8(b)) { printf("FAIL: non-finite output\n"); ok = false; }
-        ax->dispatcher(ax, effClose, 0, 0, nullptr, 0);
-    }
-
     // --- idle gate: long silence -> exact-zero passthrough, corner retained,
     //     wake processes the very first audible sample ---
     {
@@ -396,7 +319,7 @@ int main() {
         // own -- a dormant group runs no servo, so a silently cleared Freeze
         // still leaves the corner parked, and the regression hides until audio
         // returns and the corner walks off.
-        float frz = fx->getParameter(fx, kP_FREEZE);
+        float frz = fx->getParameter(fx, 6);
         printf("gate : Freeze across dormancy = %.0f (expect 1)\n", frz);
         if (frz < 0.5f) { printf("FAIL: silence gate cleared Freeze\n"); ok = false; }
 
@@ -561,7 +484,7 @@ int main() {
         // Set the knobs BEFORE the mains cycle so the 30 ms parameter smoothers
         // initialise at zero instead of gliding down from their old values.
         setParams(rx, 0, 0, 0, 0, 1, 0);
-        rx->setParameter(rx, kP_RESTORE, 0.0f);
+        rx->setParameter(rx, 5, 0.0f);
         rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
         rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
         Buffers d(1 * (int)fs);
@@ -584,7 +507,7 @@ int main() {
             rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
             rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
             setParams(rx, 0, 0, 0, 0, 1, 0);
-            rx->setParameter(rx, kP_RESTORE, depth);
+            rx->setParameter(rx, 5, depth);
             Buffers b(3 * (int)fs);
             unsigned rs = 4242u;
             for (int i = 0; i < b.n; ++i) {
@@ -623,7 +546,7 @@ int main() {
         // transport restart, in the plugin rather than the harness.)
         {
             setParams(rx, 0, 0, 0, 0, 1, 0);
-            rx->setParameter(rx, kP_RESTORE, 1.0f);          // Restore fully up
+            rx->setParameter(rx, 5, 1.0f);          // Restore fully up
             rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
             rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
             Buffers s(2 * (int)fs);                 // 1 s silence, then a tone
