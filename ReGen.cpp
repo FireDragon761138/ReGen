@@ -11,13 +11,23 @@
 // that one measurement:
 //
 //   cleanup   adaptive 12 dB/oct lowpass just above the corner buries codec
-//             swirl/hash (Cleanup knob = dry/filtered mix)
-//   smoother  envelope-ratio gain on the top octave clamps warbly level
-//             flutter without touching stable content (Smooth knob)
-//   regen     upper mids (3-8 kHz) -> soft asymmetric saturator -> highpassed
-//             above the corner and mixed in, level-linked to the real
-//             midrange envelope so quiet passages don't hiss (Regen knob)
-//   transient zero-lookahead attack boost masks pre-echo smear (Attack knob)
+//             swirl/hash (scaled by Repair)
+//   warble    detector, not a repair stage: log-envelope of the top coded
+//             octave minus the octave below it, bandpassed 8-40 Hz (codec
+//             frame rates), RMS. Shared musical modulation cancels; what
+//             remains is band-local bit-allocation flutter. The score slides
+//             the whole dull-and-replace boundary DOWN (up to 0.4 oct), so a
+//             warbling top octave gets dulled and rebuilt by translation --
+//             the translated band inherits the donor's stability, which is
+//             the only real un-warble (scaled by Repair)
+//   regen     squaring translation: the octave below the corner, squared
+//             (sum terms land one octave up, difference terms die in the
+//             injection highpass), envelope-normalized, level closed-loop
+//             matched to the source's own spectral slope extrapolated one
+//             octave -- so the rebuilt band continues the recording rather
+//             than shelving flat. Injection stops at the 16.5 kHz anchor
+//             (scaled by Repair; Repair 1.0 = slope target)
+//   transient zero-lookahead attack boost masks pre-echo smear (scaled by Repair)
 //
 // THREE deficit factors derived from the corner scale the chain, so pristine
 // content gets an automatic light touch -- no preset system needed. They are
@@ -50,13 +60,14 @@
 // Regen is additionally skipped outright once corner*1.08 reaches the anchor --
 // injecting content nobody can hear is pure cost. See regenAudible.
 //
-// Channel roles (Windows 7.1: 0 FL 1 FR 2 FC 3 LFE 4 BL 5 BR 6 SL 7 SR):
-//   FL/FR  full chain            FC     speech-tuned: no transient shaper,
-//   SL/SR  cleanup + light regen        sibilance detector ducks the exciter
-//   BL/BR  cleanup + light regen  LFE   untouched passthrough
-// Detection and dynamics gains are shared per pair so imaging never wanders.
+// No channel roles (Windows 7.1: 0 FL 1 FR 2 FC 3 LFE 4 BL 5 BR 6 SL 7 SR):
+// every channel gets the identical chain, because the plugin runs ahead of
+// any upmixer and positional sources can appear in any channel -- role
+// special-casing means positional timbre inconsistency. LFE alone passes
+// through untouched. Channels are still grouped into pairs for detection:
+// dynamics gains are shared per pair so imaging never wanders.
 //
-// Params: 0 Cleanup  1 Smooth  2 Regen  3 Attack  4 Mix  5 Restore  6 Freeze(0/1)
+// Params: 0 Repair  1 Restore  2 Freeze(0/1)
 //
 // Build: see build_mingw.bat.  License: BSD-2-Clause.
 
@@ -77,9 +88,16 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static const VstInt32 kNumParams  = 7;
-static const int      kNumSliders = 6;                 // Freeze is a checkbox
-enum { P_CLEAN = 0, P_SMOOTH, P_REGEN, P_TRANS, P_MIX, P_RESTORE, P_FREEZE };
+// One knob. Every damage-proportional stage -- dull, warble detection,
+// translation, Air tilt, transient boost -- is a facet of the same repair
+// and scales from the single Repair control; the stages' relative
+// proportions are design constants, not user homework. Restore stays
+// separate because it is a real decision (it costs latency and needs host
+// PDC); Freeze is the servo-hold utility checkbox.
+static const VstInt32 kNumParams  = 3;
+static const int      kNumSliders = 2;                 // Freeze is a checkbox
+enum { P_REPAIR = 0, P_RESTORE, P_FREEZE };
+static const double kTrnScale = 0.58;   // Attack share of Repair (0.6 -> 0.35)
 
 enum { CH_FL = 0, CH_FR, CH_FC, CH_LFE, CH_BL, CH_BR, CH_SL, CH_SR };
 
@@ -89,6 +107,9 @@ enum { CH_FL = 0, CH_FR, CH_FC, CH_LFE, CH_BL, CH_BR, CH_SL, CH_SR };
 // is a pure CPU optimisation with no signal-level signature, so this is the only
 // way a test can assert it actually happens rather than merely not breaking.
 #define REGEN_DORMANT_QUERY CCONST('D', 'o', 'r', 'm')
+// index='Dbg0', value=field -> group-0 stage internals scaled 1e9 (tooling
+// diagnostics only): 0 msDon 1 msLow 2 msInj 3 gInj*1e3 4 warble*1e3 5 slide*1e3
+#define REGEN_DEBUG_QUERY   CCONST('D', 'b', 'g', '0')
 
 // Control-rate block: adaptive coefficients and the servo update every
 // kCtrl samples (~1.3 ms at 48 kHz); per-sample cost stays pure filtering.
@@ -281,22 +302,29 @@ static const double kTrnGateOct = 0.40;     // octaves below ceiling -> full
 static const double kGateThresh = 1e-5;     // ~-100 dBFS peak
 static const double kGateHold   = 0.25;     // seconds below thresh to sleep
 
-// Clamped Pade tanh: within ~1e-3 of tanh for |x|<3, hard 1 beyond. Plenty
-// for waveshaping and much cheaper than libm's tanh at 7 calls per sample.
-static inline double fastTanh(double x) {
-    if (x >  3.0) return  1.0;
-    if (x < -3.0) return -1.0;
-    double x2 = x * x;
-    return x * (27.0 + x2) / (27.0 + 9.0 * x2);
-}
+// Warble-detection constants. The detector compares the top coded octave's
+// envelope against the donor octave below it in the 8-40 Hz modulation band
+// (Vorbis long frames tick at ~11 Hz, MP3 granules at ~38 Hz; musical
+// dynamics and noise-floor breathing sit mostly below 8 Hz -- measured with
+// tools/warble_meter, which is also this detector's calibration reference).
+// The RMS maps to a 0..1 score across the narrowband JND range and slides
+// the dull-and-replace boundary down by up to kWarbleMaxOct.
+static const double kWarbleHpHz   = 8.0;    // modulation highpass
+static const double kWarbleLpHz   = 40.0;   // modulation lowpass
+static const double kWarbleRmsSec = 0.5;    // score integration time
+static const double kWarbleDb0    = 1.0;    // dB RMS -> score 0 (JND floor)
+static const double kWarbleDb1    = 4.0;    // dB RMS -> score 1
+static const double kWarbleMaxOct = 0.4;    // max boundary slide, octaves
 
-// Asymmetric soft saturator for the exciter: the bias term adds even
-// harmonics (2nd fills the octave right above the source band), tanh adds
-// odd. The DC offset it introduces dies in the injection highpass.
-static inline double shapeHF(double n) {
-    const double tb = 0.53704956699803528;   // tanh(0.6)
-    return fastTanh(1.6 * n + 0.6) - tb;
-}
+// Air: correct a darkened surviving band toward what real content looks
+// like. The template is the average per-octave HF slope of the corpus's
+// full-bandwidth music references above 2 kHz, measured 2026-07-24 with
+// tools/warble_meter: -2 dB/oct (the flat electronic reference sits above
+// it and correctly receives none). Correction closes the gap between the
+// source's measured slope and the template, capped low per the aggression
+// lesson, and never cuts -- a source at or above the template gets nothing.
+static const double kAirTemplDb = -2.0;     // template slope, dB/oct
+static const double kAirCapDb   =  3.0;     // max boost, dB
 
 // ------------------------------------------------------------ role group ----
 // A group is one detection unit: a stereo pair or a mono channel. Detection
@@ -304,13 +332,14 @@ static inline double shapeHF(double n) {
 // envelopes are applied identically to both channels so imaging stays put.
 struct Group {
     int  chA = 0, chB = -1;               // chB < 0 -> mono group
-    bool useSmooth = false, useTrans = false, useDuck = false;
-    double exScale = 1.0;
 
     // --- rolloff servo ---
     Biquad refBP;                         // broad 1-4 kHz mid reference
     HP12   probeLo, probeHi;              // straddle the corner estimate
     double msRef = 0, msLo = 0, msHi = 0; // 200 ms mean-square meters
+    double msHiF = 0;                     // 20 ms fast meter: up-gate evidence
+    double kMS20c = 0;                    // its coefficient (needs fs)
+    int    upRun = 0;                     // consecutive alive blocks (debounce)
     double hRef = 0, hLo = 0, hHi = 0;    // gated peak-hold versions
     double wideMS = 0;                    // wideband gate meter
     double cornerLog = 0, appliedLog = -1;
@@ -331,15 +360,36 @@ struct Group {
 
     // --- adaptive processing ---
     Biquad    cleanLP[2];
-    OnePoleLP smLP[2];                    // top-band split (hb = x - lp)
-    EnvAR     hbFast, hbSlow;             // shared flutter envelopes
-    OnePoleLP ex3[2], ex8[2];             // 3-8 kHz exciter source band
+    Biquad    donHP[2], donLP[2];         // per-channel donor octave [c/2, c]
     Biquad    injHP[2][2];                // 4th-order injection highpass
-    EnvAR     midEnv;                     // shared level link
-    OnePoleLP dkLo1, dkLo2, dkHi1, dkHi2; // sibilance bands (center only)
-    EnvAR     envSib, envVoice;
+    Biquad    injLP17[2];                 // synthesis stop above the anchor
+    // mono metering path: donor octave + the octave below it, for the slope
+    // extrapolation target and the warble detector's donor comparison
+    Biquad    donMHP, donMLP, lowMHP, lowMLP;
+    EnvAR     envDon, envLow;             // fast envelopes for warble detection
+    // Pair-power donor meters for the translation level and normalizer. The
+    // mono-sum meters above are fine for RATIOS (slope, warble log-diff:
+    // stereo cancellation divides out) but not for ABSOLUTE level -- a wide
+    // stereo mix partially cancels in the sum, and a normalizer keyed to it
+    // collapses exactly on wide passages (measured: the clean PCM case
+    // injected 40 dB under the point-stereo ogg of the same music).
+    EnvAR     envDonP;                    // shared pair envelope (normalizer)
+    double    msDonP = 0;                 // pair-power donor MS (level target)
+    double    msDon = 0, msLow = 0;       // slope meters (200 ms MS, mono sum)
+    double    msInj = 0;                  // translated-signal meter (pre-gain)
+    double    gInj  = 0;                  // closed-loop injection gain, smoothed
+    double    gAir  = 0;                  // Air band boost (linear add gain)
+    // warble detector state (control rate). Each band's log-envelope gets its
+    // own 8-40 Hz modulation chain; the ratio flutter is their difference and
+    // the cross meter gives the correlation SIGN -- the arp discriminator.
+    double    tLp8 = 0, tLp40 = 0;        // top coded octave modulation
+    double    lLp8 = 0, lLp40 = 0;        // donor-below octave modulation
+    double    msT = 0, msL = 0, msX = 0;  // band mod power + cross
+    double    msWrb = 0;                  // ratio-flutter power
+    double    warble = 0;                 // 0..1 score
+    double    slideOct = 0;               // current boundary slide, octaves
 
-    // --- transient restoration (fronts only), Crystalizer-shaped ---
+    // --- transient restoration, Crystalizer-shaped ---
     // TWO bands with independent detectors and independent gains. Pre-echo is
     // high-frequency dominant (that is where the codec allocates fewest bits),
     // and a single broadband gain "repairing" it was measured putting +0.59 dB
@@ -352,17 +402,22 @@ struct Group {
     EnvAR     trFastLo, trSlowLo;
     EnvAR     trFastHi, trSlowHi;
 
+    double aW8 = 0, aW40 = 0, aWms = 0;   // ctrl-rate detector coefficients
+
     void configure(double fs, double cornerMaxLog) {
         refBP.setBP(fs, 2000.0, 0.8);
-        for (int c = 0; c < 2; ++c) {
-            ex3[c].setCutoff(fs, 3000.0);
-            ex8[c].setCutoff(fs, 8000.0);
-        }
-        dkLo1.setCutoff(fs, 1000.0); dkLo2.setCutoff(fs, 3000.0);
-        dkHi1.setCutoff(fs, 5000.0); dkHi2.setCutoff(fs, 9000.0);
-        hbFast.init(fs, 1.0, 15.0);   hbSlow.init(fs, 40.0, 80.0);
-        midEnv.init(fs, 4.0, 50.0);
-        envSib.init(fs, 3.0, 50.0);   envVoice.init(fs, 3.0, 50.0);
+        for (int c = 0; c < 2; ++c) injLP17[c].setLP(fs, 17500.0, 0.7071);
+        // 1 ms attack: the translation normalizer divides by this envelope,
+        // and a slower attack lets musical transients square up faster than
+        // the divisor tracks -- measured as huge low-duty spikes standing in
+        // for a band. Release 30 ms avoids pumping inside a modulation cycle.
+        envDon.init(fs, 1.0, 30.0);   envLow.init(fs, 1.0, 30.0);
+        envDonP.init(fs, 1.0, 30.0);
+        kMS20c = 1.0 - std::exp(-1.0 / (0.020 * fs));
+        double ctrlRate = fs / kCtrl;
+        aW8  = 1.0 - std::exp(-2.0 * M_PI * kWarbleHpHz / ctrlRate);
+        aW40 = 1.0 - std::exp(-2.0 * M_PI * kWarbleLpHz / ctrlRate);
+        aWms = 1.0 - std::exp(-1.0 / (kWarbleRmsSec * ctrlRate));
         trFastLo.init(fs, 0.5, 40.0); trSlowLo.init(fs, 15.0, 140.0);
         trFastHi.init(fs, 0.5, 40.0); trSlowHi.init(fs, 15.0, 140.0);
         trSplitD.setCutoff(fs, kTrnSplitHz);
@@ -376,23 +431,24 @@ struct Group {
 
     void resetSignalState() {         // clears audio state, keeps the learned corner
         refBP.reset(); probeLo.reset(); probeHi.reset();
-        msRef = msLo = msHi = wideMS = 0.0;
+        msRef = msLo = msHi = msHiF = wideMS = 0.0; upRun = 0;
         for (int c = 0; c < 2; ++c) {
-            cleanLP[c].reset(); smLP[c].reset();
-            ex3[c].reset(); ex8[c].reset();
-            injHP[c][0].reset(); injHP[c][1].reset();
+            cleanLP[c].reset(); donHP[c].reset(); donLP[c].reset();
+            injHP[c][0].reset(); injHP[c][1].reset(); injLP17[c].reset();
         }
-        hbFast.reset(); hbSlow.reset(); midEnv.reset();
-        envSib.reset(); envVoice.reset();
+        donMHP.reset(); donMLP.reset(); lowMHP.reset(); lowMLP.reset();
+        envDon.reset(); envLow.reset(); envDonP.reset();
+        msDon = msLow = msInj = 0.0; msDonP = 0.0; gInj = 0.0; gAir = 0.0;
+        tLp8 = tLp40 = lLp8 = lLp40 = 0.0;
+        msT = msL = msX = msWrb = 0.0; warble = 0.0; slideOct = 0.0;
         trFastLo.reset(); trSlowLo.reset(); trFastHi.reset(); trSlowHi.reset();
         trSplitD.reset(); trSplitA[0].reset(); trSplitA[1].reset();
-        dkLo1.reset(); dkLo2.reset(); dkHi1.reset(); dkHi2.reset();
     }
 
     // Control-rate servo step + adaptive coefficient refresh.
     void ctrl(double fs, bool frozen, double stepUp, double stepDown,
               double holdAtt, double holdRel, double cornerMinLog,
-              double cornerMaxLog) {
+              double cornerMaxLog, double smo, double reg) {
         bool gate = wideMS > 3e-7;    // ~-65 dBFS: below this, hold everything
         auto hold = [&](double& h, double e) {
             if (e > h)     h += holdAtt * (e - h);
@@ -402,8 +458,26 @@ struct Group {
 
         if (!frozen && gate && hRef > 1e-8) {
             double th = hRef * 2.5e-4 + 1e-12;      // -36 dB alive threshold
-            if      (hHi > th) cornerLog += stepUp;   // real content above -> open
-            else if (hLo < th) cornerLog -= stepDown; // nothing at corner -> close
+            // Up-steps take the 20 ms FAST meter, not the peak-hold or even
+            // the 200 ms meter: the corner climbs at 2 oct/s, so any verdict
+            // that outlives its evidence lets a burst carry the corner
+            // through the wall -- 40 dB of decay is 0.9 s at the 200 ms
+            // meter, exactly a 6 kHz -> ceiling runaway (measured: damage=0,
+            // plugin fully idle, for 15 s of a 45 s brickwalled file after a
+            // breakdown-then-drop). At 20 ms the same decay is 90 ms and the
+            // overshoot stays ~0.2 oct. The hold stays on the DOWN gate,
+            // where surviving bass-only passages is exactly what it is for.
+            // ...debounced ~32 ms: a signal stopping dead is a broadband
+            // step edge that rings the highpass probe, and a meter fast
+            // enough to drop the runaway is fast enough to catch that ring
+            // (the old peak-hold's 80 ms attack was silently the debounce).
+            // Real content sustains; edges and rings do not.
+            if (msHiF > th) {
+                if (++upRun >= 24) cornerLog += stepUp; // live content above
+            } else {
+                upRun = 0;
+                if (hLo < th) cornerLog -= stepDown;    // nothing at corner
+            }
             if (cornerLog < cornerMinLog) cornerLog = cornerMinLog;
             if (cornerLog > cornerMaxLog) cornerLog = cornerMaxLog;
         }
@@ -423,16 +497,106 @@ struct Group {
         wClean = clamp01((kAudIdleHz - corner * 1.25) / kAudSpanHz);
         wRegen = clamp01((kAudIdleHz - corner * 1.08) / kAudSpanHz);
 
-        if (std::fabs(cornerLog - appliedLog) > 5e-4) {
-            appliedLog = cornerLog;
+        // -- warble detector (ctrl rate; the envelopes run per-sample) --
+        // Log-envelope difference between the top coded octave and its donor
+        // cancels shared musical modulation; the 8-40 Hz remainder is
+        // band-local frame-rate flutter. dSmooth gates it to coded content
+        // near a wall, where warble can exist at all.
+        // Runs whenever warble CAN exist (dSmooth gate), independent of the
+        // Smooth knob: the translation temper below consumes msT even when
+        // the slide is disabled. smo scales the slide, not the measurement.
+        if (dSmooth > 0.0) {
+            double lt = std::log(envDon.v + 1e-9);
+            double ll = std::log(envLow.v + 1e-9);
+            tLp8 += aW8 * (lt - tLp8);  double thp = lt - tLp8;
+            tLp40 += aW40 * (thp - tLp40);
+            lLp8 += aW8 * (ll - lLp8);  double lhp = ll - lLp8;
+            lLp40 += aW40 * (lhp - lLp40);
+            double wbp = tLp40 - lLp40;                  // ratio flutter
+            msWrb += aWms * (wbp * wbp - msWrb);
+            msT   += aWms * (tLp40 * tLp40 - msT);
+            msL   += aWms * (lLp40 * lLp40 - msL);
+            msX   += aWms * (tLp40 * lLp40 - msX);
+            double db = 8.6859 * std::sqrt(msWrb);       // ln-RMS -> dB RMS
+            // Arp discriminator: chiptune arpeggios/PWM trade energy BETWEEN
+            // octaves, so their band modulations anti-correlate -- which the
+            // ratio amplifies maximally. Codec flutter is uncorrelated
+            // (independent per-band bit allocation). Gate the score to zero
+            // as normalized correlation approaches -0.5.
+            double ncc = msX / std::sqrt(msT * msL + 1e-18);
+            double arpGate = clamp01(1.0 + 2.0 * ncc);
+            warble = clamp01((db - kWarbleDb0) / (kWarbleDb1 - kWarbleDb0)) * arpGate;
+        } else {
+            warble = 0.0;
+        }
+        // The slide is the detector's only output: the whole dull-and-replace
+        // boundary (cleanup lowpass, donor band, injection highpass) moves
+        // down together so the flutter band gets dulled AND covered by the
+        // translated band. Smoothed by the score's own 0.5 s integrator.
+        slideOct = smo * warble * dSmooth * kWarbleMaxOct;
+
+        // -- closed-loop translation level --
+        // Target: continue the source's own per-octave slope one octave up.
+        // Open-loop in signal terms (the meters are slow), so no instability.
+        // Slope capped at 1.0: a flat or rising spectrum is continued flat,
+        // never amplified -- the rebuilt octave can carry at most the donor's
+        // per-octave energy. Boost mistakes are the unforgiving kind.
+        double slope = (msDon + 1e-12) / (msLow + 1e-12);
+        if (slope < 0.05) slope = 0.05;
+        if (slope > 1.00) slope = 1.00;
+        // Level from the pair-power meter: absolute, phase-immune. The slope
+        // ratio stays mono -- stereo cancellation divides out of a ratio.
+        // Tempered by the donor's own 8-40 Hz modulation: squaring DOUBLES
+        // dB-domain flutter, so a donor fluttering (or arpeggiating) at 2 dB
+        // yields a 4 dB-fluttering band -- audible as warble we created.
+        // Full level below ~1 dB donor flutter, backed off above, floor 0.3.
+        double donFlutDb = 8.6859 * std::sqrt(msT);
+        double temper = clamp01(1.2 - 0.25 * donFlutDb);
+        if (temper < 0.3) temper = 0.3;
+        double targetMS = msDonP * slope * temper * (reg * reg);
+
+        // -- Air: close the surviving band's tilt gap toward the template --
+        // Self-limiting (gap <= 0 -> nothing) and boost-only; the donor band
+        // [c/2, c] is the surviving band's top, where truncation darkening
+        // lives. Audibility-weighted by where that band actually sits.
+        double slopeDb = 10.0 * std::log10(slope);
+        double gapDb = kAirTemplDb - slopeDb;
+        if (gapDb < 0.0) gapDb = 0.0;
+        if (gapDb > kAirCapDb) gapDb = kAirCapDb;
+        double wAir = clamp01((kAudIdleHz - corner) / kAudSpanHz);
+        gAir = std::pow(10.0, gapDb * reg * damage * wAir / 20.0) - 1.0;
+        double g = std::sqrt(targetMS / (msInj + 1e-12));
+        if (g > 6.0) g = 6.0;
+        gInj += 0.15 * (g - gInj);
+
+        double effLog = cornerLog - slideOct;
+        if (std::fabs(effLog - appliedLog) > 5e-4) {
+            appliedLog = effLog;
+            double eff = std::exp2(effLog);
             probeLo.set(fs, corner);
             probeHi.set(fs, std::min(corner * 1.30, fs * 0.47));
+            // slope/warble meters key off the unslid corner: the slope is a
+            // property of the source, not of where we cut
+            donMHP.setHP(fs, corner * 0.50, 0.7071);
+            donMLP.setLP(fs, corner,        0.7071);
+            lowMHP.setHP(fs, corner * 0.25, 0.7071);
+            lowMLP.setLP(fs, corner * 0.50, 0.7071);
             int nch = (chB >= 0) ? 2 : 1;
             for (int c = 0; c < nch; ++c) {
-                cleanLP[c].setLP(fs, corner * 1.25, 0.7071);
-                injHP[c][0].setHP(fs, corner * 1.08, 0.5412);
-                injHP[c][1].setHP(fs, corner * 1.08, 1.3066);
-                smLP[c].setCutoff(fs, corner * 0.55);
+                cleanLP[c].setLP(fs, eff * 1.25, 0.7071);
+                donHP[c].setHP(fs, eff * 0.50, 0.7071);
+                donLP[c].setLP(fs, eff,        0.7071);
+                // Injection starts BELOW the corner estimate: the servo's
+                // probes read a clean tonal wall up to ~0.25 oct high (skirt
+                // leakage; the harness measures a 10k wall as ~11.7k), and an
+                // injection placed above that bias leaves a gap between the
+                // real wall and the rebuilt band -- measured as a still-dead
+                // octave on resampled PCM while ogg filled fine. The 0.23 oct
+                // reach-down guarantees coverage; when the estimate is honest
+                // the overlap sits in the coded band's dying top octave and
+                // the closed-loop level target absorbs the sum.
+                injHP[c][0].setHP(fs, eff * 0.85, 0.5412);
+                injHP[c][1].setHP(fs, eff * 0.85, 1.3066);
             }
         }
     }
@@ -441,7 +605,7 @@ struct Group {
     // (only ours are touched); dry[] is the untouched input. kMS100/kMS200 are
     // the meter one-pole coefficients; cln/smo/reg/trn are the smoothed knobs.
     inline void tick(double* x, const double* dry, double kMS100, double kMS200,
-                     double cln, double smo, double reg, double trn) {
+                     double cln, double reg, double trn) {
         int a = chA, b = chB;
 
         // -- per-group idle gate --
@@ -470,6 +634,32 @@ struct Group {
         double r  = refBP.process(m);   msRef += kMS200 * (r * r - msRef);
         double lo = probeLo.process(m); msLo  += kMS200 * (lo * lo - msLo);
         double hi = probeHi.process(m); msHi  += kMS200 * (hi * hi - msHi);
+        msHiF += kMS20c * (hi * hi - msHiF);
+
+        // -- slope + warble metering (consumed by ctrl()) --
+        // Mono-sum meters feed the RATIOS (slope, warble log-diff); the
+        // per-channel donor filters feed the phase-immune pair-power level
+        // meter and the shared normalizer envelope. Same filters later feed
+        // the translation itself, so they run whenever the source is damaged.
+        bool dMeter = damage > 0.02;
+        double dA = 0.0, dB = 0.0;
+        if (dMeter) {
+            double dm = donMLP.process(donMHP.process(m));
+            double lm = lowMLP.process(lowMHP.process(m));
+            msDon += kMS200 * (dm * dm - msDon);
+            msLow += kMS200 * (lm * lm - msLow);
+            envDon.next(std::fabs(dm));
+            envLow.next(std::fabs(lm));
+            dA = donLP[0].process(donHP[0].process(xa));
+            double pp, ea;
+            if (b >= 0) {
+                dB = donLP[1].process(donHP[1].process(xb));
+                pp = 0.5 * (dA * dA + dB * dB);
+                ea = 0.5 * (std::fabs(dA) + std::fabs(dB));
+            } else { pp = dA * dA; ea = std::fabs(dA); }
+            msDonP += kMS200 * (pp - msDonP);
+            envDonP.next(ea);
+        }
 
         // -- cleanup: bury swirl/hash just above the corner --
         // Gated like the stages below rather than run-and-multiply-by-zero: at
@@ -483,46 +673,43 @@ struct Group {
             if (b >= 0) { double lpB = cleanLP[1].process(xb); xb += cEff * (lpB - xb); }
         }
 
-        // -- top-octave flutter smoother (attenuate-only, shared gain) --
-        // Skipped when its gain is zero (pristine content / knob down); the
-        // gain ramps continuously through zero, so re-engaging never clicks
-        // even though the envelopes restart cold.
-        if (useSmooth && smo * dSmooth > 1e-3) {
-            double hbA = xa - smLP[0].process(xa);
-            double hbB = (b >= 0) ? xb - smLP[1].process(xb) : 0.0;
-            double he  = (b >= 0) ? 0.5 * (std::fabs(hbA) + std::fabs(hbB))
-                                  : std::fabs(hbA);
-            double ef = hbFast.next(he), es = hbSlow.next(he);
-            double g = (es + 1e-7) / (ef + 1e-7);
-            if (g > 1.0)  g = 1.0;
-            if (g < 0.35) g = 0.35;
-            double ge = 1.0 + smo * dSmooth * (g - 1.0);
-            xa += (ge - 1.0) * hbA;
-            if (b >= 0) xb += (ge - 1.0) * hbB;
+        // -- regeneration: squaring translation of the donor octave --
+        // x^2 on a band [f1, f2] lands its sum terms on [2*f1, 2*f2] -- an
+        // octave-up translation that keeps the donor's character (tonal stays
+        // tonal, noise stays noise) and its envelope. Difference terms fall
+        // near DC and die in the 4th-order injection highpass. Normalizing by
+        // the shared donor envelope keeps the translated band envelope-linear
+        // (a raw square tracks env^2 -- expander behavior); absolute level is
+        // the closed-loop gInj from ctrl(), aimed at the slope target. The
+        // injection lowpass stops synthesis above the audibility anchor.
+        // Gain-gated: the add ramps from zero on re-engage, so no click.
+        if (dMeter && reg * damage * wRegen > 1e-3) {
+            double nrm = 1.0 / (1.4142 * envDonP.v + 3e-4);
+            // The normalized square is non-negative and unbounded; soft-cap
+            // it at 3x the envelope so a transient cannot turn the band into
+            // sparse spikes (smooth cap: no hard-clip splatter, linear-ish
+            // below 1 so the translated fine structure survives).
+            double nA = dA * dA * nrm;  nA = nA / (1.0 + nA * (1.0 / 3.0));
+            double yA = injLP17[0].process(
+                        injHP[0][1].process(injHP[0][0].process(nA)));
+            double yB = 0.0;
+            if (b >= 0) {
+                double nB = dB * dB * nrm;  nB = nB / (1.0 + nB * (1.0 / 3.0));
+                yB = injLP17[1].process(
+                     injHP[1][1].process(injHP[1][0].process(nB)));
+            }
+            msInj += kMS200 * (((b >= 0) ? 0.5 * (yA * yA + yB * yB)
+                                         : yA * yA) - msInj);
+            double gAdd = gInj * damage * wRegen;
+            xa += yA * gAdd;
+            if (b >= 0) xb += yB * gAdd;
         }
 
-        // -- regeneration: harmonics from 3-8 kHz, injected above the corner --
-        // Also gain-gated like the smoother: envelopes restart cold on
-        // re-engage but the add ramps up from zero, so no click.
-        double gEx = reg * exScale * damage * wRegen * 1.2;
-        if (gEx > 1e-3) {
-            double bpA = ex8[0].process(xa - ex3[0].process(xa));
-            double bpB = (b >= 0) ? ex8[1].process(xb - ex3[1].process(xb)) : 0.0;
-            double ae  = (b >= 0) ? 0.5 * (std::fabs(bpA) + std::fabs(bpB))
-                                  : std::fabs(bpA);
-            double me  = midEnv.next(ae);
-            if (useDuck) {   // duck the exciter on /s/ so dialogue doesn't spit
-                double v  = dkLo2.process(xa) - dkLo1.process(xa);   // 1-3 kHz
-                double s  = dkHi2.process(xa) - dkHi1.process(xa);   // 5-9 kHz
-                double rv = envVoice.next(std::fabs(v));
-                double rs = envSib.next(std::fabs(s));
-                double rr = rs / (rv + 1e-6);
-                gEx *= 1.0 / (1.0 + 3.0 * std::max(0.0, rr - 0.7));
-            }
-            double nrm = 1.0 / (1.4142 * me + 3e-4);   // normalize, shape, re-link
-            xa += injHP[0][1].process(injHP[0][0].process(shapeHF(bpA * nrm))) * me * gEx;
-            if (b >= 0)
-                xb += injHP[1][1].process(injHP[1][0].process(shapeHF(bpB * nrm))) * me * gEx;
+        // -- Air: boost-only tilt correction on the surviving band's top --
+        // (gAir is fully weighted in ctrl(); dA/dB are the donor band taps)
+        if (dMeter && gAir > 1e-3) {
+            xa += gAir * dA;
+            if (b >= 0) xb += gAir * dB;
         }
 
         // -- transient restoration: per-band onset boost --
@@ -533,7 +720,7 @@ struct Group {
         // that produces pre-echo ("a sharp attack beginning near the end of a
         // transform block immediately following a region of low energy") and
         // also where backward masking has least to work with.
-        if (useTrans && trn * damage > 1e-3) {
+        if (trn * damage > 1e-3) {
             double dm  = (b >= 0) ? 0.5 * (dry[a] + dry[b]) : dry[a];
             double dLo = trSplitD.process(dm);
             double dHi = dm - dLo;
@@ -552,7 +739,7 @@ struct Group {
             double gHi = 1.0 + tEff * 0.8 * onH;  if (gHi > 2.0) gHi = 2.0;
 
             // The application split runs unconditionally so its state stays
-            // warm (two one-poles, and only the front group sets useTrans), but
+            // warm (two one-poles per group), but
             // the recombine is skipped when neither band is lifting: steady
             // material then stays bit-exact, since lo + (x - lo) is not
             // guaranteed to round-trip exactly in floating point.
@@ -719,7 +906,7 @@ struct ReGen {
     double stepUp = 0, stepDown = 0, holdAtt = 0, holdRel = 0;
     double cornerMinLog = 0, cornerMaxLog = 0;
 
-    Smooth smClean, smSmooth, smRegen, smTrans, smMix, smRestore;
+    Smooth smRepair, smRestore;
 
 #if defined(_WIN32)
     HWND edContainer = nullptr;
@@ -746,18 +933,9 @@ struct ReGen {
     }
 
     void setDefaultParams() {
-        params[P_CLEAN]  = 0.7f;
-        params[P_SMOOTH] = 0.5f;
-        params[P_REGEN]  = 0.6f;
-        // 0.35, not the 0.5 that ReGen-retro-defaults.md offers as its
-        // alternative: that branch was conditioned on Attack self-disabling on
-        // content that does not need it. Removing the corner dependence gives
-        // exactly that up -- the stage is now always available and idles only
-        // on steady material -- so the conservative branch is the right one.
-        params[P_TRANS]  = 0.35f;
-        params[P_MIX]    = 1.0f;
+        params[P_REPAIR]  = 0.6f;         // the calibrated default
         params[P_RESTORE] = 0.0f;         // off: costs latency, needs host PDC
-        params[P_FREEZE] = 0.0f;
+        params[P_FREEZE]  = 0.0f;
     }
 
     void setSampleRate(double sr) {
@@ -774,20 +952,12 @@ struct ReGen {
         cornerMaxLog = std::log2(std::min(20000.0, 0.44 * fs));
 
         groups[G_FRONT]  = Group{}; groups[G_FRONT].chA  = CH_FL; groups[G_FRONT].chB  = CH_FR;
-        groups[G_FRONT].useSmooth = true; groups[G_FRONT].useTrans = true;
         groups[G_CENTER] = Group{}; groups[G_CENTER].chA = CH_FC;
-        groups[G_CENTER].useSmooth = true; groups[G_CENTER].useDuck = true;
         groups[G_SIDE]   = Group{}; groups[G_SIDE].chA   = CH_SL; groups[G_SIDE].chB   = CH_SR;
-        groups[G_SIDE].exScale = 0.6;
         groups[G_BACK]   = Group{}; groups[G_BACK].chA   = CH_BL; groups[G_BACK].chB   = CH_BR;
-        groups[G_BACK].exScale = 0.6;
         for (int g = 0; g < kNumGroups; ++g) groups[g].configure(fs, cornerMaxLog);
 
-        smClean.init(fs, 30.0, params[P_CLEAN]);
-        smSmooth.init(fs, 30.0, params[P_SMOOTH]);
-        smRegen.init(fs, 30.0, params[P_REGEN]);
-        smTrans.init(fs, 30.0, params[P_TRANS]);
-        smMix.init(fs, 30.0, params[P_MIX]);
+        smRepair.init(fs, 30.0, params[P_REPAIR]);
         smRestore.init(fs, 30.0, params[P_RESTORE]);
         int lat = restoreAllowed ? restore.configure(fs) : 0;
         if (effect.initialDelay != lat) {
@@ -827,7 +997,8 @@ struct ReGen {
         for (int g = 0; g < kNumGroups; ++g) {
             if (groups[g].dormant) continue;   // meters are zeroed; corner parked
             groups[g].ctrl(fs, frozen, stepUp, stepDown, holdAtt, holdRel,
-                           cornerMinLog, cornerMaxLog);
+                           cornerMinLog, cornerMaxLog,
+                           params[P_REPAIR], params[P_REPAIR]);
         }
     }
 
@@ -869,9 +1040,7 @@ struct ReGen {
                 }
                 dormant = false; silentRun = 0;    // wake ON this sample
                 ctrlCount = 0;                     // apply coefficients now
-                smClean.snap(params[P_CLEAN]);  smSmooth.snap(params[P_SMOOTH]);
-                smRegen.snap(params[P_REGEN]);  smTrans.snap(params[P_TRANS]);
-                smMix.snap(params[P_MIX]);
+                smRepair.snap(params[P_REPAIR]);
             } else if (peak < kGateThresh) {
                 if (++silentRun >= hang) {
                     // Decaying state has flushed to ~0 by now; make it exact.
@@ -886,20 +1055,15 @@ struct ReGen {
 
             if (ctrlCount-- <= 0) { ctrlUpdate(); ctrlCount = kCtrl - 1; }
 
-            double cln = smClean.next(params[P_CLEAN]);
-            double smo = smSmooth.next(params[P_SMOOTH]);
-            double reg = smRegen.next(params[P_REGEN]);
-            double trn = smTrans.next(params[P_TRANS]);
-            double mix = smMix.next(params[P_MIX]);
+            double rep = smRepair.next(params[P_REPAIR]);
 
             for (int g = 0; g < kNumGroups; ++g)
-                groups[g].tick(x, dry, kMS100, kMS200, cln, smo, reg, trn);
+                groups[g].tick(x, dry, kMS100, kMS200, rep, rep, kTrnScale * rep);
 
             for (int c = 0; c < 8; ++c) {
                 if (!out[c]) continue;
                 if (c == CH_LFE) { out[c][i] = (T)dry[c]; continue; }
-                double y = dry[c] + mix * (x[c] - dry[c]);
-                out[c][i] = (T)softclip(y);
+                out[c][i] = (T)softclip(x[c]);
             }
         }
         _mm_setcsr(csr);
@@ -908,7 +1072,7 @@ struct ReGen {
 
 // ------------------------------------------------------------- editor GUI ----
 #if defined(_WIN32)
-static VstRect g_edRect = { 0, 0, 378, 460 };
+static VstRect g_edRect = { 0, 0, 268, 460 };
 
 enum { kResetId = 200, kFreezeId = 201, kStatusTimer = 1 };
 
@@ -1009,7 +1173,7 @@ void ReGen::openEditor(HWND parent) {
                     374, 6, 74, 22, edContainer,
                     (HMENU)(intptr_t)kResetId, inst, nullptr);
 
-    const char* names[kNumSliders] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix", "Restore" };
+    const char* names[kNumSliders] = { "Repair", "Restore" };
     for (int i = 0; i < kNumSliders; ++i) {
         int y = 40 + i * 48;
         CreateWindowExA(0, "STATIC", names[i], WS_CHILD | WS_VISIBLE,
@@ -1160,11 +1324,10 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
         if (index < 0 || index >= kNumParams) { copyStr(ptr, "", kMaxParamStr); return 0; }
         if (opcode == effGetParamName) {
             // Must fit kVstMaxParamStrLen (8 bytes -> 7 chars).
-            const char* names[] = { "Cleanup", "Smooth", "Regen", "Attack", "Mix",
-                                    "Restore", "Freeze" };
+            const char* names[] = { "Repair", "Restore", "Freeze" };
             copyStr(ptr, names[index], kMaxParamStr);
         } else if (opcode == effGetParamLabel) {
-            const char* labels[] = { "%", "%", "%", "%", "%", "%", "" };
+            const char* labels[] = { "%", "%", "" };
             copyStr(ptr, labels[index], kMaxParamStr);
         } else { // display
             if (index == P_FREEZE) {
@@ -1190,6 +1353,23 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
             VstIntPtr m = 0;
             for (int g = 0; g < kNumGroups; ++g) if (p->groups[g].dormant) m |= (1 << g);
             return m;
+        }
+        if (index == REGEN_DEBUG_QUERY && p) {
+            const Group& g = p->groups[0];
+            double v = 0;
+            switch ((int)value) {
+                case 0: v = g.msDon;         break;
+                case 1: v = g.msLow;         break;
+                case 2: v = g.msInj;         break;
+                case 3: v = g.gInj * 1e-6;   break;
+                case 4: v = g.warble * 1e-6; break;
+                case 5: v = g.slideOct * 1e-6; break;
+                case 6: v = g.wRegen * 1e-6;   break;
+                case 7: v = g.damage * 1e-6;   break;
+                case 8: v = std::exp2(g.cornerLog) * 1e-3; break;
+                case 9: v = g.msDonP;        break;
+            }
+            return (VstIntPtr)std::llround(v * 1e9);
         }
         return 0;
 

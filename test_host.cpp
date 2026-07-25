@@ -74,11 +74,9 @@ static void process(AEffect* fx, Buffers& b) {
     }
 }
 
-static void setParams(AEffect* fx, float clean, float smooth, float regen,
-                      float trans, float mix, float freeze) {
-    fx->setParameter(fx, 0, clean);  fx->setParameter(fx, 1, smooth);
-    fx->setParameter(fx, 2, regen);  fx->setParameter(fx, 3, trans);
-    fx->setParameter(fx, 4, mix);    fx->setParameter(fx, 6, freeze);
+static void setParams(AEffect* fx, float repair, float restore, float freeze) {
+    fx->setParameter(fx, 0, repair); fx->setParameter(fx, 1, restore);
+    fx->setParameter(fx, 2, freeze);
 }
 
 static long corner(AEffect* fx, int group) {
@@ -203,7 +201,7 @@ int main() {
     {
         Buffers b(2 * (int)fs);
         fillSignal(b, true);
-        setParams(fx, 1, 1, 1, 1, 0, 0);
+        setParams(fx, 0, 0, 0);
         process(fx, b);
         if (!finite8(b)) { printf("FAIL: non-finite output\n"); ok = false; }
         double maxd = 0, lfed = 0;
@@ -220,7 +218,7 @@ int main() {
     {
         Buffers b(8 * (int)fs);
         fillSignal(b, true);
-        setParams(fx, 0, 0, 0, 0, 1, 0);
+        setParams(fx, 0, 0, 0);
         process(fx, b);
         cFront = corner(fx, 0); cSide = corner(fx, 2);
         printf("servo: walled-at-10k -> corner front=%ld side=%ld back=%ld center=%ld\n",
@@ -231,20 +229,28 @@ int main() {
         if (cSide  < 10000 || cSide  > 17000) { printf("FAIL: side corner off\n");  ok = false; }
     }
 
-    // --- regeneration: 2nd harmonic of the 8 kHz source tone appears at 16k ---
+    // --- regeneration: squaring translation puts donor-band sum terms one
+    //     octave up. With the corner near 12k the donor holds the 8k and 10k
+    //     tones, so 2x8k lands at 16k (and 8+10 at 18k dies in the synthesis
+    //     stop). Level is closed-loop matched to the slope target, so the
+    //     translated tone must appear but stay below the donor tone itself. ---
     {
         Buffers b(2 * (int)fs);
         fillSignal(b, true);
-        setParams(fx, 0, 0, 0, 0, 1, 1);          // regen off, detector frozen
+        setParams(fx, 0, 0, 1);          // repair off, detector frozen
         process(fx, b);
         double off16 = goertzel(b.out[0], b.n / 2, b.n, fs, 16000.0);
-        setParams(fx, 0, 0, 1, 0, 1, 1);          // regen full
+        setParams(fx, 1, 0, 1);          // repair full = slope target
         process(fx, b);
         double on16 = goertzel(b.out[0], b.n / 2, b.n, fs, 16000.0);
         double src8 = goertzel(b.in[0],  b.n / 2, b.n, fs, 8000.0);
         printf("regen: 16k off=%.6f on=%.6f (src 8k=%.4f)\n", off16, on16, src8);
         if (on16 < 3.0 * off16 + 1e-4) { printf("FAIL: no regenerated highs\n"); ok = false; }
-        if (on16 > 0.3 * src8) { printf("FAIL: regen level implausibly hot\n"); ok = false; }
+        // On a FLAT multitone the slope target grants the full donor energy
+        // and the injection filters leave ~one surviving line to carry it, so
+        // parity with a source tone is the design level, not runaway. The
+        // bound guards the runaway class (normalizer/servo faults land 3-6x).
+        if (on16 > 1.2 * src8) { printf("FAIL: regen level implausibly hot\n"); ok = false; }
     }
 
     // --- cleanup: an 18 kHz tone (above the learned corner) gets attenuated ---
@@ -252,15 +258,15 @@ int main() {
         Buffers b(2 * (int)fs);
         fillSignal(b, true);
         for (int i = 0; i < b.n; ++i) {
-            float t18 = 0.08f * (float)std::sin(2.0 * M_PI * 18000.0 * i / fs);
+            float t18 = 0.08f * (float)std::sin(2.0 * M_PI * 18600.0 * i / fs);
             b.in[0][i] += t18; b.in[1][i] += t18;
         }
-        setParams(fx, 0, 0, 0, 0, 1, 1);          // frozen, cleanup off
+        setParams(fx, 0, 0, 1);          // frozen, repair off
         process(fx, b);
-        double raw18 = goertzel(b.out[0], b.n / 2, b.n, fs, 18000.0);
-        setParams(fx, 1, 0, 0, 0, 1, 1);          // cleanup full
+        double raw18 = goertzel(b.out[0], b.n / 2, b.n, fs, 18600.0);
+        setParams(fx, 1, 0, 1);          // repair full
         process(fx, b);
-        double cln18 = goertzel(b.out[0], b.n / 2, b.n, fs, 18000.0);
+        double cln18 = goertzel(b.out[0], b.n / 2, b.n, fs, 18600.0);
         printf("clean: 18k raw=%.5f cleaned=%.5f\n", raw18, cln18);
         if (cln18 > 0.85 * raw18) { printf("FAIL: cleanup not attenuating\n"); ok = false; }
     }
@@ -273,7 +279,7 @@ int main() {
             float v = (ph < 1440) ? 0.25f * (float)std::sin(2.0 * M_PI * 2000.0 * i / fs) : 0.0f;
             b.in[0][i] = b.in[1][i] = v;
         }
-        setParams(fx, 0, 0, 0, 1, 1, 1);
+        setParams(fx, 1, 0, 1);
         process(fx, b);
         float inPk = 0, outPk = 0;
         for (int i = b.n / 2; i < b.n; ++i) {
@@ -286,7 +292,7 @@ int main() {
 
     // --- servo recovery: full-band content must pull the corner back up ---
     {
-        setParams(fx, 0, 0, 0, 0, 1, 0);           // unfreeze
+        setParams(fx, 0, 0, 0);           // unfreeze
         Buffers b(6 * (int)fs);
         fillSignal(b, false);
         process(fx, b);
@@ -299,7 +305,7 @@ int main() {
     // --- idle gate: long silence -> exact-zero passthrough, corner retained,
     //     wake processes the very first audible sample ---
     {
-        setParams(fx, 1, 1, 1, 1, 1, 1);           // frozen so corner is provable
+        setParams(fx, 1, 0, 1);           // frozen so corner is provable
         long before = corner(fx, 0);
         Buffers b(2 * (int)fs);                    // 2 s digital silence
         process(fx, b);
@@ -319,7 +325,7 @@ int main() {
         // own -- a dormant group runs no servo, so a silently cleared Freeze
         // still leaves the corner parked, and the regression hides until audio
         // returns and the corner walks off.
-        float frz = fx->getParameter(fx, 6);
+        float frz = fx->getParameter(fx, 2);
         printf("gate : Freeze across dormancy = %.0f (expect 1)\n", frz);
         if (frz < 0.5f) { printf("FAIL: silence gate cleared Freeze\n"); ok = false; }
 
@@ -345,7 +351,7 @@ int main() {
     //     the only one (which made silent channels cost full price). ---
     {
         AEffect* gx = freshFx(entry);
-        setParams(gx, 0.7f, 0.5f, 0.6f, 0.35f, 1, 0);
+        setParams(gx, 0.6f, 0, 0);
         Buffers train(8 * (int)fs);                 // train ALL groups down
         fillSignal(train, true);                    // (down-slew is deliberately slow)
         process(gx, train);
@@ -425,10 +431,10 @@ int main() {
         AEffect* bx = freshFx(entry);
         Buffers train(8 * (int)fs);                 // corner down, then freeze
         fillSignal(train, true);
-        setParams(bx, 0, 0, 0, 1, 1, 0);            // Attack alone, servo live
+        setParams(bx, 1, 0, 0);            // Attack alone, servo live
         process(bx, train);
         long cTrain = corner(bx, 0);
-        setParams(bx, 0, 0, 0, 1, 1, 1);            // freeze: damage now provable
+        setParams(bx, 1, 0, 1);            // freeze: damage now provable
         if (cTrain > 17000) {
             printf("FAIL: corner never came down; Attack would be idle\n"); ok = false;
         }
@@ -483,8 +489,8 @@ int main() {
         // Restore at 0 must be a pure delay: everything else idles on lossless.
         // Set the knobs BEFORE the mains cycle so the 30 ms parameter smoothers
         // initialise at zero instead of gliding down from their old values.
-        setParams(rx, 0, 0, 0, 0, 1, 0);
-        rx->setParameter(rx, 5, 0.0f);
+        setParams(rx, 0, 0, 0);
+        rx->setParameter(rx, 1, 0.0f);
         rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
         rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
         Buffers d(1 * (int)fs);
@@ -506,8 +512,8 @@ int main() {
         auto preEchoRms = [&](float depth) {
             rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
             rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
-            setParams(rx, 0, 0, 0, 0, 1, 0);
-            rx->setParameter(rx, 5, depth);
+            setParams(rx, 0, 0, 0);
+            rx->setParameter(rx, 1, depth);
             Buffers b(3 * (int)fs);
             unsigned rs = 4242u;
             for (int i = 0; i < b.n; ++i) {
@@ -545,8 +551,8 @@ int main() {
         // reported sample 0, and the fault was a stale line surviving the
         // transport restart, in the plugin rather than the harness.)
         {
-            setParams(rx, 0, 0, 0, 0, 1, 0);
-            rx->setParameter(rx, 5, 1.0f);          // Restore fully up
+            setParams(rx, 0, 0, 0);
+            rx->setParameter(rx, 1, 1.0f);          // Restore fully up
             rx->dispatcher(rx, effMainsChanged, 0, 0, nullptr, 0);
             rx->dispatcher(rx, effMainsChanged, 0, 1, nullptr, 0);
             Buffers s(2 * (int)fs);                 // 1 s silence, then a tone

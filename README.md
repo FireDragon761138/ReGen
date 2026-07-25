@@ -1,4 +1,3 @@
-
 # ReGen — lossy-audio reconstruction for Equalizer APO
 
 A 64-bit VST2 plugin that cleans up and partially reconstructs lossy/legacy
