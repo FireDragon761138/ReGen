@@ -316,6 +316,44 @@ static const double kWarbleDb0    = 1.0;    // dB RMS -> score 0 (JND floor)
 static const double kWarbleDb1    = 4.0;    // dB RMS -> score 1
 static const double kWarbleMaxOct = 0.4;    // max boundary slide, octaves
 
+// ------------------------------------------------------------- tunables ----
+// The internal design constants the tuning harness may override at runtime
+// via effVendorSpecific 'Tune' (index='Tune', value=id, opt=new value;
+// value=-1 resets all). Tooling surface only: shipped configs never set
+// these, and the defaults ARE the shipped behavior. Process-global.
+enum {
+    TN_TRNSCALE = 0,   // Attack share of Repair
+    TN_AIRTEMPL,       // Air template slope, dB/oct
+    TN_AIRCAP,         // Air max boost, dB
+    TN_TMPSLOPE,       // temper dB->factor slope
+    TN_TMPFLOOR,       // temper floor
+    TN_SLOPECAP,       // translation slope-ratio cap
+    TN_REACH,          // injection highpass, fraction of eff corner
+    TN_WRBDB0,         // warble score floor, dB RMS
+    TN_WRBDB1,         // warble score ceiling, dB RMS
+    TN_RSTRATIO,       // Restore attack:pre-window ratio
+    TN_NRMREL,         // translation normalizer release, ms
+    TN_WRBMAXOCT,      // max warble boundary slide, oct
+    TN_RSTMAXDB,       // Restore deepest cut, dB
+    TN_RSTSLOWREL,     // Restore detector slow-envelope release, ms
+    NTUNE
+};
+static const double kTuneDefault[NTUNE] = {
+    0.58, -2.0, 3.0, 0.25, 0.30, 1.00, 0.85, 1.0, 4.0, 6.0, 30.0, 0.4, 14.0, 250.0
+};
+// First 12: the 2026-07-25 face-off winner (blind human ABX + verdict vs
+// the hand-tuned originals; see DESIGN.md, derby v2) -- except [9]
+// TN_RSTRATIO, which the race never exercised (Restore was off) and the
+// 2026-07-25 Restore pass set deliberately. Levers 9/12/13 per that pass
+// (RESTORE_RESEARCH.md + castanet grid, judge-scored): fire at ~12 dB
+// attack:pre ratio, cut 6 dB toward the floor not silence, slow release
+// 25 ms so the detector recovers between roll hits.
+static double g_tune[NTUNE] = {
+    0.20, -0.339357, 2.995877, 0.085655, 0.536270, 0.723904, 0.859073,
+    0.864070, 7.138318, 4.0, 94.450482, 0.423601, 6.0, 25.0
+};
+#define REGEN_TUNE_QUERY CCONST('T', 'u', 'n', 'e')
+
 // Air: correct a darkened surviving band toward what real content looks
 // like. The template is the average per-octave HF slope of the corpus's
 // full-bandwidth music references above 2 kHz, measured 2026-07-24 with
@@ -412,7 +450,7 @@ struct Group {
         // the divisor tracks -- measured as huge low-duty spikes standing in
         // for a band. Release 30 ms avoids pumping inside a modulation cycle.
         envDon.init(fs, 1.0, 30.0);   envLow.init(fs, 1.0, 30.0);
-        envDonP.init(fs, 1.0, 30.0);
+        envDonP.init(fs, 1.0, g_tune[TN_NRMREL]);
         kMS20c = 1.0 - std::exp(-1.0 / (0.020 * fs));
         double ctrlRate = fs / kCtrl;
         aW8  = 1.0 - std::exp(-2.0 * M_PI * kWarbleHpHz / ctrlRate);
@@ -525,7 +563,8 @@ struct Group {
             // as normalized correlation approaches -0.5.
             double ncc = msX / std::sqrt(msT * msL + 1e-18);
             double arpGate = clamp01(1.0 + 2.0 * ncc);
-            warble = clamp01((db - kWarbleDb0) / (kWarbleDb1 - kWarbleDb0)) * arpGate;
+            warble = clamp01((db - g_tune[TN_WRBDB0])
+                            / (g_tune[TN_WRBDB1] - g_tune[TN_WRBDB0])) * arpGate;
         } else {
             warble = 0.0;
         }
@@ -533,7 +572,7 @@ struct Group {
         // boundary (cleanup lowpass, donor band, injection highpass) moves
         // down together so the flutter band gets dulled AND covered by the
         // translated band. Smoothed by the score's own 0.5 s integrator.
-        slideOct = smo * warble * dSmooth * kWarbleMaxOct;
+        slideOct = smo * warble * dSmooth * g_tune[TN_WRBMAXOCT];
 
         // -- closed-loop translation level --
         // Target: continue the source's own per-octave slope one octave up.
@@ -543,7 +582,7 @@ struct Group {
         // per-octave energy. Boost mistakes are the unforgiving kind.
         double slope = (msDon + 1e-12) / (msLow + 1e-12);
         if (slope < 0.05) slope = 0.05;
-        if (slope > 1.00) slope = 1.00;
+        if (slope > g_tune[TN_SLOPECAP]) slope = g_tune[TN_SLOPECAP];
         // Level from the pair-power meter: absolute, phase-immune. The slope
         // ratio stays mono -- stereo cancellation divides out of a ratio.
         // Tempered by the donor's own 8-40 Hz modulation: squaring DOUBLES
@@ -551,8 +590,8 @@ struct Group {
         // yields a 4 dB-fluttering band -- audible as warble we created.
         // Full level below ~1 dB donor flutter, backed off above, floor 0.3.
         double donFlutDb = 8.6859 * std::sqrt(msT);
-        double temper = clamp01(1.2 - 0.25 * donFlutDb);
-        if (temper < 0.3) temper = 0.3;
+        double temper = clamp01(1.2 - g_tune[TN_TMPSLOPE] * donFlutDb);
+        if (temper < g_tune[TN_TMPFLOOR]) temper = g_tune[TN_TMPFLOOR];
         double targetMS = msDonP * slope * temper * (reg * reg);
 
         // -- Air: close the surviving band's tilt gap toward the template --
@@ -560,9 +599,9 @@ struct Group {
         // [c/2, c] is the surviving band's top, where truncation darkening
         // lives. Audibility-weighted by where that band actually sits.
         double slopeDb = 10.0 * std::log10(slope);
-        double gapDb = kAirTemplDb - slopeDb;
+        double gapDb = g_tune[TN_AIRTEMPL] - slopeDb;
         if (gapDb < 0.0) gapDb = 0.0;
-        if (gapDb > kAirCapDb) gapDb = kAirCapDb;
+        if (gapDb > g_tune[TN_AIRCAP]) gapDb = g_tune[TN_AIRCAP];
         double wAir = clamp01((kAudIdleHz - corner) / kAudSpanHz);
         gAir = std::pow(10.0, gapDb * reg * damage * wAir / 20.0) - 1.0;
         double g = std::sqrt(targetMS / (msInj + 1e-12));
@@ -595,8 +634,8 @@ struct Group {
                 // reach-down guarantees coverage; when the estimate is honest
                 // the overlap sits in the coded band's dying top octave and
                 // the closed-loop level target absorbs the sum.
-                injHP[c][0].setHP(fs, eff * 0.85, 0.5412);
-                injHP[c][1].setHP(fs, eff * 0.85, 1.3066);
+                injHP[c][0].setHP(fs, eff * g_tune[TN_REACH], 0.5412);
+                injHP[c][1].setHP(fs, eff * g_tune[TN_REACH], 1.3066);
             }
         }
     }
@@ -782,14 +821,17 @@ struct Group {
 // delay compensation -- 32 ms of uncompensated latency would wreck A/V sync.
 static const double kRestoreLookMs  = 32.0;    // > MP3 long block (26.1 ms @44.1k)
 static const double kRestoreWinMs   = 26.0;    // suppression window
-static const double kRestoreRampMs  =  2.0;    // edge ramps, no step at the attack
-static const double kRestoreSplitHz = 3000.0;  // pre-echo is high-frequency
-static const double kRestoreRatio   =  6.0;    // attack : pre-window, ~15.6 dB
-static const double kRestoreMaxDb   = 14.0;    // deepest cut at Restore = 1
+static const double kRestoreRampMs  =  2.0;    // attack-edge ramp, no step at the hit
+static const double kRestoreSplitHz = 700.0;   // cut floor: below this, pre-echo
+                                               // is not separable from signal and
+                                               // cuts do audible harm
+// ratio / max-cut / slow-release live in g_tune (TN_RSTRATIO, TN_RSTMAXDB,
+// TN_RSTSLOWREL)
 
 struct RestoreStage {
     std::vector<float> dl[8];             // every channel: latency must be uniform
     std::vector<float> gring;             // scheduled HF gain, 1 = untouched
+    std::vector<float> efring;            // fast-envelope history for the width scan
     int len = 0, L = 0, W = 0, ramp = 1, wpos = 0, hold = 0, holdLen = 0;
     OnePoleLP splitD, splitA[2];          // hf = x - lp
     EnvAR envFast, envSlow;
@@ -804,11 +846,12 @@ struct RestoreStage {
         len = L + 8;
         for (int c = 0; c < 8; ++c) dl[c].assign(len, 0.0f);
         gring.assign(len, 1.0f);
+        efring.assign(len, 0.0f);
         splitD.setCutoff(fs, kRestoreSplitHz);
         splitA[0].setCutoff(fs, kRestoreSplitHz);
         splitA[1].setCutoff(fs, kRestoreSplitHz);
         envFast.init(fs, 0.3, 20.0);
-        envSlow.init(fs, 25.0, 250.0);
+        envSlow.init(fs, 25.0, g_tune[TN_RSTSLOWREL]);
         holdLen = (int)(0.005 * fs);
         wpos = 0; hold = 0; ready = true;
         return L;
@@ -817,21 +860,38 @@ struct RestoreStage {
     void reset() {
         for (int c = 0; c < 8; ++c) std::fill(dl[c].begin(), dl[c].end(), 0.0f);
         std::fill(gring.begin(), gring.end(), 1.0f);
+        std::fill(efring.begin(), efring.end(), 0.0f);
         splitD.reset(); splitA[0].reset(); splitA[1].reset();
         envFast.reset(); envSlow.reset();
         wpos = 0; hold = 0;
     }
 
     // Paint the attenuation profile back over the window preceding the attack.
-    // W < L guarantees none of it has been emitted yet. min() so overlapping
-    // hits deepen rather than overwrite each other.
-    void schedule(double gain) {
-        for (int k = 1; k <= W; ++k) {
+    // W < L guarantees none of it has been emitted yet.
+    //
+    // Width estimation first: walk back through the fast-envelope history and
+    // stop where the pre-window stops being quiet -- that is the previous
+    // hit's decay (real signal), not codec noise, and cutting it punches
+    // audible holes in rolls. Only the genuinely quiet valley is treated.
+    // Then the cut is dB-linear: deepest just before the attack, fading to
+    // nothing at the far (early) edge -- pre-echo grows toward the hit.
+    // min() so overlapping hits deepen rather than overwrite each other.
+    void schedule(double cutDb, double atk) {
+        int Weff = W;
+        double thr = atk * 0.25;              // -12 dB of this attack
+        // skip the attack's own rise (inside the ramp guard) -- the envelope
+        // needs ~0.3 ms to fire, so the last samples before wpos are the hit
+        for (int k = ramp + 1; k <= W; ++k) {
             int idx = wpos - k; while (idx < 0) idx += len;
-            double f;
-            if (k <= ramp)            f = 1.0 - (1.0 - gain) * (double)k / ramp;
-            else if (k > W - ramp)    f = 1.0 - (1.0 - gain) * (double)(W - k) / ramp;
-            else                      f = gain;
+            if (efring[idx] > thr) { Weff = k - 1; break; }
+        }
+        if (Weff < 2 * ramp + 2) return;      // no usable valley (dense roll)
+        for (int k = 1; k <= Weff; ++k) {
+            int idx = wpos - k; while (idx < 0) idx += len;
+            double d = cutDb * (double)(Weff - k) / (Weff - ramp);
+            if (k <= ramp) d *= (double)k / ramp;    // no step at the attack
+            if (d > cutDb) d = cutDb;
+            double f = std::pow(10.0, -d / 20.0);
             if (f < gring[idx]) gring[idx] = (float)f;
         }
     }
@@ -844,14 +904,13 @@ struct RestoreStage {
         double hf = dm - splitD.process(dm);
         double a  = std::fabs(hf);
         double ef = envFast.next(a), es = envSlow.next(a);
+        efring[wpos] = (float)ef;
 
         if (hold > 0) --hold;
-        else if (es > 1e-7 && ef > es * kRestoreRatio) {
+        else if (es > 1e-7 && ef > es * g_tune[TN_RSTRATIO]) {
             // Sharper attack out of a quieter window -> deeper cut, capped.
-            double excess = ef / (es * kRestoreRatio) - 1.0;
-            double d = depth * clamp01(excess);
-            double gain = std::pow(10.0, -kRestoreMaxDb * d / 20.0);
-            schedule(gain);
+            double excess = ef / (es * g_tune[TN_RSTRATIO]) - 1.0;
+            schedule(g_tune[TN_RSTMAXDB] * depth * clamp01(excess), ef);
             hold = holdLen;
         }
 
@@ -1058,7 +1117,7 @@ struct ReGen {
             double rep = smRepair.next(params[P_REPAIR]);
 
             for (int g = 0; g < kNumGroups; ++g)
-                groups[g].tick(x, dry, kMS100, kMS200, rep, rep, kTrnScale * rep);
+                groups[g].tick(x, dry, kMS100, kMS200, rep, rep, g_tune[TN_TRNSCALE] * rep);
 
             for (int c = 0; c < 8; ++c) {
                 if (!out[c]) continue;
@@ -1353,6 +1412,18 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
             VstIntPtr m = 0;
             for (int g = 0; g < kNumGroups; ++g) if (p->groups[g].dormant) m |= (1 << g);
             return m;
+        }
+        if (index == REGEN_TUNE_QUERY && p) {
+            if ((int)value < 0)
+                for (int k = 0; k < NTUNE; ++k) g_tune[k] = kTuneDefault[k];
+            else if ((int)value < NTUNE) g_tune[(int)value] = (double)opt;
+            for (int g = 0; g < kNumGroups; ++g) {
+                p->groups[g].envDonP.init(p->fs, 1.0, g_tune[TN_NRMREL]);
+                p->groups[g].appliedLog = -1.0;
+            }
+            if (p->restore.ready)
+                p->restore.envSlow.init(p->fs, 25.0, g_tune[TN_RSTSLOWREL]);
+            return 1;
         }
         if (index == REGEN_DEBUG_QUERY && p) {
             const Group& g = p->groups[0];
