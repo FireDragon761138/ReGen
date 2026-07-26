@@ -150,8 +150,4 @@ ReGen — adaptive reconstruction for lossy and band-limited game audio
 Copyright (C) 2026 <FireDragon761138>
 
 This program is licensed under BSD-2 licens.  See License.md for details.
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, see <https://www.gnu.org/licenses/>.
+No warrantee or guarantee is offered of any kind for use.
