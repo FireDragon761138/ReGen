@@ -1,6 +1,6 @@
 # ReGen — lossy-audio reconstruction for Equalizer APO
 
-A 64-bit VST2 plugin that cleans up and partially reconstructs lossy/legacy
+A 64-bit VST2-compatible plugin that cleans up and partially reconstructs lossy/legacy
 game audio: low-rate Vorbis/MP3 streams and low-sample-rate (22/11 kHz-class)
 assets. 8-in/8-out, everything IIR, zero latency under Equalizer APO. (In a
 DAW the optional lookahead **Restore** stage reserves a fixed 32 ms whether or
