@@ -146,8 +146,6 @@ Latency: 0 samples under EAPO. Denormals are flushed (FTZ/DAZ).
 | `'Dorm'` | bitmask of dormant groups |
 | `'Dbg0'`, value 0–9 | group-0 stage internals (diagnostics) |
 
-SPDX-License-Identifier: GPL-2.0-only
-
 ReGen — adaptive reconstruction for lossy and band-limited game audio
 Copyright (C) 2026 <FireDragon761138>
 
