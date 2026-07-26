@@ -145,3 +145,20 @@ Latency: 0 samples under EAPO. Denormals are flushed (FTZ/DAZ).
 | `'Roff'`, value 0–3 | that group's detected corner in Hz |
 | `'Dorm'` | bitmask of dormant groups |
 | `'Dbg0'`, value 0–9 | group-0 stage internals (diagnostics) |
+
+SPDX-License-Identifier: GPL-2.0-only
+
+ReGen — adaptive reconstruction for lossy and band-limited game audio
+Copyright (C) 2026 <FireDragon761138>
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2,
+as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, see <https://www.gnu.org/licenses/>.
